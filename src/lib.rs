@@ -4,6 +4,7 @@ pub mod board;
 pub mod book;
 pub mod eval;
 pub mod movegen;
+pub mod nnue;
 pub mod perft;
 pub mod search;
 pub mod see;

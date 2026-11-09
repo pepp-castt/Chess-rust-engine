@@ -120,8 +120,20 @@ fn pst_index(color: Color, sq: Square) -> usize {
     }
 }
 
-/// Evaluation from the side to move, in centipawns.
+/// Evaluation from the side to move, in centipawns: NNUE when a net is loaded and
+/// `UseNNUE` is on, otherwise the hand-crafted evaluation below.
+#[inline]
 pub fn evaluate(pos: &Position) -> i32 {
+    if crate::nnue::enabled() {
+        if let Some(v) = crate::nnue::evaluate(pos) {
+            return v;
+        }
+    }
+    evaluate_hce(pos)
+}
+
+/// Hand-crafted (PeSTO + terms) evaluation, kept as fallback and as a baseline.
+pub fn evaluate_hce(pos: &Position) -> i32 {
     let mut mg = [0i32; 2];
     let mut eg = [0i32; 2];
     let mut phase = 0i32;

@@ -82,6 +82,7 @@ pub fn run() {
                 println!("option name Threads type spin default 1 min 1 max 1");
                 println!("option name MoveOverhead type spin default 20 min 0 max 5000");
                 println!("option name Clear Hash type button");
+                println!("option name UseNNUE type check default true");
                 println!("uciok");
             }
             "isready" => {
@@ -118,6 +119,11 @@ pub fn run() {
                             }
                         }
                         "Clear Hash" => engine.tt.clear(),
+                        "UseNNUE" => {
+                            if let Some(v) = value {
+                                crate::nnue::set_enabled(v.eq_ignore_ascii_case("true"));
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -244,6 +250,11 @@ pub fn run() {
             "eval" => {
                 let e = evaluate(&engine.pos);
                 println!("info string eval {} cp (side to move)", e);
+                println!(
+                    "info string eval_hce {} eval_nnue {}",
+                    crate::eval::evaluate_hce(&engine.pos),
+                    crate::nnue::evaluate(&engine.pos).map_or("none".to_string(), |v| v.to_string())
+                );
             }
             "perft" => {
                 let d: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
