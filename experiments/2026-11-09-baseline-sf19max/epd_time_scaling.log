@@ -1,0 +1,4 @@
+movetime 0.5
+ng@0.5s      solved 22/74 =  29.7%  95% CI [20.5, 40.9]
+movetime 3.0
+ng@3.0s      solved 27/74 =  36.5%  95% CI [26.4, 47.9]
