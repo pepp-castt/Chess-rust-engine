@@ -1,0 +1,134 @@
+name: Teacher E (SF19 MAX >=500ms: material-perturbed + MultiPV-diverse)
+
+# Agent E. Runs on pepp-castt/Chess-rust-engine's own Actions pool so it does not compete with
+# nnue-teacher.yml shards on the upstream repo.
+#
+# Why: the first net trained on SF-vs-SF self-play lost 1-2-97 to HCE because that data has almost no
+# material imbalance (see Chess-rust-engine#1). Two generators fix that, both labelled by Stockfish 19
+# at FULL strength with a hard >=500 ms floor per position:
+#   tools/nnue/relabel_perturbed.py  real quiet positions with 1-2 pieces removed, SF labels them
+#   tools/nnue/datagen_diverse.py    SF self-play that sometimes plays a MultiPV runner-up (<=70 cp)
+#
+# Output: merged+deduped 28-byte records, branch `teacher-data-e`:
+#   data/perturbed-<run>.bin, data/diverse-<run>.bin   (+ merge logs)
+
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "Parallel shards (4 procs each)"
+        default: "20"
+      minutes:
+        description: "Minutes per shard"
+        default: "40"
+      movetime_ms:
+        description: "SF19 ms per position (floor 500)"
+        default: "500"
+      seed:
+        description: "Seed (change for fresh data)"
+        default: "1"
+      src_url:
+        description: "Teacher shard to take real positions from"
+        default: "https://raw.githubusercontent.com/archanapriyadarshini1st-debug/Chess-rust-engine/teacher-data/data/teacher-42595442579.bin"
+
+permissions:
+  contents: write
+
+env:
+  SF19_URL: https://github.com/official-stockfish/Stockfish/releases/download/sf_19/stockfish-linux-x86-64-universal.tar.gz
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.p.outputs.shards }}
+    steps:
+      - id: p
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          n = int("${{ inputs.shards }}")
+          assert int("${{ inputs.movetime_ms }}") >= 500, "movetime floor is 500 ms"
+          print("shards=" + json.dumps(list(range(1, n + 1))))
+          PY
+
+  datagen:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install chess numpy
+      - name: Stockfish 19 (official release, full strength)
+        run: |
+          mkdir -p /tmp/sf && curl -fsSL --retry 3 "$SF19_URL" | tar xz -C /tmp/sf
+          SF=$(find /tmp/sf -type f -name 'stockfish-linux-x86-64-universal' | head -1)
+          chmod +x "$SF"; ln -sf "$SF" /tmp/sf19
+          printf 'uci\nquit\n' | /tmp/sf19 | grep 'id name'
+      - name: Source positions
+        run: |
+          curl -fsSL --retry 3 "${{ inputs.src_url }}" -o /tmp/src.bin
+          ls -la /tmp/src.bin
+      - name: Generate (2 procs perturbed + 2 procs diverse, in parallel)
+        run: |
+          S=$(( ${{ inputs.seed }} * 1000 + ${{ matrix.shard }} ))
+          mkdir -p data
+          python3 tools/nnue/relabel_perturbed.py --stockfish /tmp/sf19 --src /tmp/src.bin \
+            --minutes ${{ inputs.minutes }} --movetime-ms ${{ inputs.movetime_ms }} --procs 2 \
+            --seed $S --out data/perturbed-${{ matrix.shard }}.bin &
+          python3 tools/nnue/datagen_diverse.py --stockfish /tmp/sf19 \
+            --minutes ${{ inputs.minutes }} --movetime-ms ${{ inputs.movetime_ms }} --procs 2 \
+            --seed $S --out data/diverse-${{ matrix.shard }}.bin &
+          wait
+          ls -la data
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: data/*.bin
+          retention-days: 7
+          compression-level: 9
+
+  merge:
+    needs: datagen
+    if: ${{ always() && needs.datagen.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+          merge-multiple: true
+      - name: Merge + dedupe
+        run: |
+          mkdir -p out
+          python3 tools/nnue/merge_dedupe.py out/perturbed-${{ github.run_id }}.bin 'shards/perturbed-*.bin' | tee out/merge-perturbed-${{ github.run_id }}.log
+          python3 tools/nnue/merge_dedupe.py out/diverse-${{ github.run_id }}.bin 'shards/diverse-*.bin' | tee out/merge-diverse-${{ github.run_id }}.log
+          ls -la out
+      - name: Publish to branch teacher-data-e
+        run: |
+          set -e
+          git config user.name "agent-e"; git config user.email "agent-e@users.noreply.github.com"
+          mkdir -p /tmp/pub && cp out/* /tmp/pub/
+          if git fetch origin teacher-data-e 2>/dev/null; then
+            git checkout -f -B teacher-data-e origin/teacher-data-e
+          else
+            git checkout -f --orphan teacher-data-e
+            git rm -rf . -q || true
+          fi
+          mkdir -p data && cp /tmp/pub/* data/
+          printf '# Teacher data E (SF19 MAX >=500ms). perturbed-*.bin = material-perturbed real positions; diverse-*.bin = MultiPV-sampled self-play. 28-byte records for tools/nnue/train.py.\n' > README.md
+          git add -A
+          git commit -m "teacher-e data run ${{ github.run_id }}"
+          git push origin teacher-data-e
