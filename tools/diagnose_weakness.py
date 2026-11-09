@@ -84,6 +84,37 @@ def static_eval(ours_path: str, fen: str, move: chess.Move | None) -> int | None
     return int(m.group(1)) if m else None
 
 
+def stable_solve(ladder: dict, acceptable: list):
+    """Smallest depth d such that the engine's move is acceptable at d AND every deeper rung.
+
+    A best-of-N 'ever acceptable' test counts move flip-flopping as convergence and
+    over-attributes to search depth (measured: it said 51% search/variance while 6x more
+    time solved only +7 pts). Stable convergence is the honest criterion."""
+    items = sorted((int(k), v) for k, v in ladder.items())
+    solve = None
+    for d, m in reversed(items):
+        if m in acceptable:
+            solve = d
+        else:
+            break
+    return solve
+
+
+def classify(row: dict) -> str:
+    if not row.get("legal", True):
+        return "movegen"
+    if row.get("replay_acceptable"):
+        return "history-variance"
+    solve = row.get("solve_depth")
+    if solve is not None and solve - row["orig_depth"] <= 2:
+        return "search-depth"
+    if solve is not None:
+        return "search-pruning"
+    if row.get("static_prefers_played"):
+        return "eval"
+    return "search-horizon"
+
+
 def run_diag(a) -> int:
     out_dir = Path(a.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -164,6 +195,12 @@ def run_diag(a) -> int:
         "wall_s": round(time.time() - t_start, 1),
         "note": "score perspective: cp from OUR side; replay starts from FEN (no repetition history)",
     }
+    write_outputs(out_dir, prov, rows)
+    print(f"games={games} positions={positions} mistakes={len(rows)} -> {out_dir}")
+    return 0
+
+
+def write_outputs(out_dir: Path, prov: dict, rows: list):
     (out_dir / "provenance.json").write_text(json.dumps(prov, indent=2))
     with open(out_dir / "diagnosis.jsonl", "w") as fo:
         for r in rows:
@@ -179,8 +216,6 @@ def run_diag(a) -> int:
         for r in rows:
             fo.write(f'{r["fen"]}\t{r["best"]}\t{r["best_cp"]}\t{r["class"]}\n')
     write_report(out_dir / "report.md", prov, rows)
-    print(f"games={games} positions={positions} mistakes={len(rows)} -> {out_dir}")
-    return 0
 
 
 def diagnose_one(a, ours, board, played, best, best_cp, played_cp, loss, cands, gid, ply, comment):
@@ -212,17 +247,15 @@ def diagnose_one(a, ours, board, played, best, best_cp, played_cp, loss, cands, 
         row["replay_acceptable"] = bool(legal and r.move in acceptable)
         # (b) depth ladder
         ladder = {}
-        solve = None
         for d in range(orig_depth, orig_depth + a.extra_plies + 1, 2):
             rr = ours.play(board, chess.engine.Limit(depth=d, time=a.depth_cap_s), info=chess.engine.INFO_SCORE)
             mv = rr.move
             if mv is not None and mv not in board.legal_moves:
                 legal = False
             ladder[d] = mv.uci() if mv else None
-            if mv in acceptable and solve is None:
-                solve = d
         row["ladder"] = ladder
-        row["solve_depth"] = solve
+        row["any_solve_depth"] = min((d for d, m in ladder.items() if m in row["acceptable"]), default=None)
+        row["solve_depth"] = stable_solve(ladder, row["acceptable"])
         row["legal"] = legal
     except (chess.engine.EngineError, chess.engine.EngineTerminatedError) as e:
         row.update({"legal": False, "error": str(e)})
@@ -239,18 +272,7 @@ def diagnose_one(a, ours, board, played, best, best_cp, played_cp, loss, cands, 
     )
     row["static_prefers_played"] = bool(prefers_played)
 
-    if not row["legal"]:
-        row["class"] = "movegen"
-    elif row["replay_acceptable"]:
-        row["class"] = "history-variance"
-    elif solve is not None and solve - orig_depth <= 2:
-        row["class"] = "search-depth"
-    elif solve is not None:
-        row["class"] = "search-pruning"
-    elif prefers_played:
-        row["class"] = "eval"
-    else:
-        row["class"] = "search-horizon"
+    row["class"] = classify(row)
     return row
 
 
@@ -296,10 +318,26 @@ def write_report(path: Path, prov: dict, rows: list[dict]):
     path.write_text("\n".join(L))
 
 
+def reclassify(d: str) -> int:
+    """Re-run attribution on stored diagnosis.jsonl (no Stockfish needed)."""
+    out_dir = Path(d)
+    rows = [json.loads(l) for l in open(out_dir / "diagnosis.jsonl")]
+    for r in rows:
+        r["solve_depth"] = stable_solve(r.get("ladder", {}), r["acceptable"])
+        r["class"] = classify(r)
+    prov = json.loads((out_dir / "provenance.json").read_text())
+    prov["mistakes"] = len(rows)
+    prov["classifier"] = "stable-solve v2 (acceptable at depth d and all deeper rungs)"
+    write_outputs(out_dir, prov, rows)
+    print(f"reclassified {len(rows)} -> {out_dir}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("pgn", nargs="+")
-    ap.add_argument("--stockfish", required=True)
+    ap.add_argument("pgn", nargs="*")
+    ap.add_argument("--reclassify", default="", help="DIR with diagnosis.jsonl: recompute classes offline")
+    ap.add_argument("--stockfish", default="")
     ap.add_argument("--ours", default="target/release/chess-rust-engine")
     ap.add_argument("--ours-rev", default="unknown")
     ap.add_argument("--name", action="append", default=None, help="substring(s) of our engine's PGN name")
@@ -316,6 +354,10 @@ def main() -> int:
     ap.add_argument("--all-games", action="store_true")
     ap.add_argument("--out-dir", default="results/diagnosis")
     a = ap.parse_args()
+    if a.reclassify:
+        return reclassify(a.reclassify)
+    if not a.pgn or not a.stockfish:
+        ap.error("pgn files and --stockfish are required unless --reclassify is used")
     a.name = a.name or ["NextGen", "Chess-rust-engine", "Rust"]
     return run_diag(a)
 
