@@ -1,0 +1,73 @@
+name: Weakness loop (play SF19 MAX -> diagnose -> hard suite)
+
+# Learning-from-mistakes loop, mission section 4:
+#   play NextGen vs Stockfish 19 (full strength unless sf_elo is set) at a REAL time control,
+#   label every non-decided position of the lost games with SF19 MultiPV (>= 0.5 s),
+#   attribute each costly mistake (movegen / history-variance / search-depth /
+#   search-pruning / eval / search-horizon), and publish
+#     diagnosis.jsonl, hard_suite.epd, hard_positions.tsv, report.md, provenance.json
+#   as artifact `weakness-<run_id>`.
+# Hard floors (shared owner rules): TC base >= 5 s, teacher >= 0.5 s/position.
+# Not a merge gate (see sprt.yml). The EPD suite is a smoke alarm; SPRT decides merges.
+
+on:
+  workflow_dispatch:
+    inputs:
+      games:
+        description: "Games (paired colours per opening)"
+        default: "40"
+      tc:
+        description: "base+inc seconds (base >= 5)"
+        default: "10+0.1"
+      sf_elo:
+        description: "0 = SF19 full strength; else UCI_Elo"
+        default: "0"
+      label_ms:
+        description: "SF19 ms per labelled position (floor 500)"
+        default: "1000"
+      seed:
+        description: "Opening shuffle seed"
+        default: "1"
+
+permissions:
+  contents: read
+
+env:
+  SF19_URL: https://github.com/official-stockfish/Stockfish/releases/download/sf_19/stockfish-linux-x86-64-universal.tar.gz
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install chess numpy
+      - name: Build engine
+        run: cargo build --release
+      - name: Stockfish 19 (official, pinned release)
+        run: |
+          mkdir -p /tmp/sf && curl -fsSL --retry 3 "$SF19_URL" | tar xz -C /tmp/sf
+          SF=$(find /tmp/sf -type f -name 'stockfish-linux-x86-64-universal' | head -1)
+          chmod +x "$SF"; ln -sf "$SF" /tmp/sf19
+          printf 'uci\nquit\n' | /tmp/sf19 | grep 'id name'
+      - name: Play
+        run: |
+          python3 tools/play_max.py --stockfish /tmp/sf19 --games "${{ inputs.games }}" \
+            --workers 2 --tc "${{ inputs.tc }}" --sf-elo "${{ inputs.sf_elo }}" \
+            --seed "${{ inputs.seed }}" --book tools/openings_book.epd --pgn results/games.pgn
+      - name: Diagnose
+        run: |
+          python3 tools/diagnose_weakness.py results/games.pgn --stockfish /tmp/sf19 \
+            --ours target/release/chess-rust-engine --ours-rev "$(git rev-parse --short HEAD)" \
+            --movetime "$(python3 -c 'print(${{ inputs.label_ms }}/1000)')" --multipv 4 \
+            --threads 3 --out-dir results/diagnosis
+          cat results/diagnosis/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: weakness-${{ github.run_id }}
+          path: results/
+          retention-days: 30
