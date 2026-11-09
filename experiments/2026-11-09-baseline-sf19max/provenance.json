@@ -1,0 +1,33 @@
+{
+  "date_utc": "2026-11-09T13:47:17Z",
+  "teacher": "Stockfish 19",
+  "teacher_settings": {
+    "UCI_LimitStrength": false,
+    "Threads": 3,
+    "Hash": 128,
+    "movetime_s": 1.0,
+    "multipv": 4
+  },
+  "engine": "Chess-rust-engine 0.1.0",
+  "engine_rev": "6ce2055",
+  "pgn_inputs": [
+    "results/max1.pgn"
+  ],
+  "mining": {
+    "min_loss_cp": 80,
+    "max_abs_cp": 600,
+    "tol_cp": 30,
+    "skip_plies": 0
+  },
+  "games_analysed": 24,
+  "our_positions_labelled": 362,
+  "mistakes": 74,
+  "host": {
+    "cpus": 4,
+    "machine": "x86_64",
+    "python": "3.11.2"
+  },
+  "wall_s": 1700.7,
+  "note": "score perspective: cp from OUR side; replay starts from FEN (no repetition history)",
+  "classifier": "stable-solve v2 (acceptable at depth d and all deeper rungs)"
+}
