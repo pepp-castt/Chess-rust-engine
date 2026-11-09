@@ -26,6 +26,36 @@ def pack(board: chess.Board, score: int, wdl: int) -> bytes:
     return REC.pack(occ, b, 0 if board.turn else 1, score, wdl)
 
 
+ENDGAMES = ["KQvK", "KRvK", "KPvK", "KBNvK", "KRvKP", "KQvKR", "KRPvKR", "KRvKB", "KRvKN", "KBPvK",
+            "KQPvKQ", "KNPvK", "KPPvKP", "KRRvKR", "KQvKP", "KBvKN", "KRBvKR", "KQvKRP", "KPPvK",
+            "KRPPvKR", "KBBvKN", "KQRvKQ", "KRNvKR", "KPvKP", "KBPvKB", "KNPvKB"]
+PT = {"Q": chess.QUEEN, "R": chess.ROOK, "B": chess.BISHOP, "N": chess.KNIGHT, "P": chess.PAWN, "K": chess.KING}
+
+
+def random_endgame(rnd):
+    """Random legal endgame position from a material recipe like 'KRPvKR'."""
+    recipe = rnd.choice(ENDGAMES)
+    w, b = recipe.split("v")
+    for _ in range(200):
+        board = chess.Board(None)
+        ok = True
+        for color, pieces in ((chess.WHITE, w), (chess.BLACK, b)):
+            for ch in pieces:
+                for _ in range(50):
+                    sq = rnd.randrange(8, 56) if ch == "P" else rnd.randrange(64)
+                    if board.piece_at(sq) is None:
+                        board.set_piece_at(sq, chess.Piece(PT[ch], color))
+                        break
+                else:
+                    ok = False
+        if not ok:
+            continue
+        board.turn = rnd.random() < 0.5
+        if board.is_valid() and not board.is_game_over() and not board.is_insufficient_material():
+            return board
+    return None
+
+
 def worker(args):
     wid, sf, minutes, nodes, out, seed = args
     rnd = random.Random(seed * 1000 + wid)
@@ -35,19 +65,25 @@ def worker(args):
     games = npos = 0
     f = open(out, "ab")
     while time.time() < t_end:
-        board = chess.Board()
-        # random opening: 8-12 plies, then require a balanced position
-        for _ in range(rnd.randint(8, 12)):
-            mv = rnd.choice(list(board.legal_moves))
-            board.push(mv)
+        endgame = rnd.random() < 0.15  # 15% of games start from a random endgame recipe
+        if endgame:
+            board = random_endgame(rnd)
+            if board is None:
+                continue
+        else:
+            board = chess.Board()
+            # random opening: 8-12 plies, then require a balanced position
+            for _ in range(rnd.randint(8, 12)):
+                mv = rnd.choice(list(board.legal_moves))
+                board.push(mv)
+                if board.is_game_over():
+                    break
             if board.is_game_over():
-                break
-        if board.is_game_over():
-            continue
-        info = eng.analyse(board, chess.engine.Limit(nodes=nodes // 2))
-        sc = info["score"].pov(chess.WHITE)
-        if sc.is_mate() or abs(sc.score()) > 250:
-            continue
+                continue
+            info = eng.analyse(board, chess.engine.Limit(nodes=nodes // 2))
+            sc = info["score"].pov(chess.WHITE)
+            if sc.is_mate() or abs(sc.score()) > 250:
+                continue
         recs = []  # (board copy, score_stm)
         win_run = 0  # consecutive plies with |score|>1200 favouring the same side
         win_side = None
@@ -56,7 +92,7 @@ def worker(args):
         while True:
             if board.is_game_over(claim_draw=True) or board.ply() > 400:
                 break
-            n = max(5000, int(nodes * rnd.uniform(0.75, 1.25)))
+            n = max(5000, int(nodes * rnd.uniform(0.75, 1.25) * (0.5 if endgame else 1.0)))
             r = eng.play(board, chess.engine.Limit(nodes=n), info=chess.engine.INFO_SCORE)
             if r.move is None:
                 break
@@ -66,15 +102,17 @@ def worker(args):
             else:
                 cp = s.score()
             quiet = (not board.is_check()) and (not board.is_capture(r.move)) and r.move.promotion is None
-            if quiet and abs(cp) < 3000:
-                recs.append((pack(board, cp, 1)[:-1], board.turn))
+            if quiet:
+                # decisive positions keep a saturated label (mate -> +-3000) instead of being dropped,
+                # otherwise the net never sees "this is simply won" (KQK/KRK drive-to-mate).
+                recs.append((pack(board, max(-3000, min(3000, cp)), 1)[:-1], board.turn))
             # adjudication by SF's own score (teacher), generous thresholds
             white_cp = cp if board.turn else -cp
             if abs(white_cp) >= 1500:
                 side = white_cp > 0
                 win_run = win_run + 1 if win_side == side else 1
                 win_side = side
-                if win_run >= 6:
+                if win_run >= (12 if endgame else 6):
                     result = 1.0 if side else 0.0
                     break
             else:
