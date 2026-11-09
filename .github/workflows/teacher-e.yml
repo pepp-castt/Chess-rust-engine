@@ -1,4 +1,4 @@
-name: Teacher E (SF19 MAX >=500ms: material-perturbed + MultiPV-diverse)
+name: "Teacher E (SF19 MAX >=500ms, material-perturbed + MultiPV-diverse)"
 
 # Agent E. Runs on pepp-castt/Chess-rust-engine's own Actions pool so it does not compete with
 # nnue-teacher.yml shards on the upstream repo.
