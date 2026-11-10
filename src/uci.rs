@@ -83,6 +83,7 @@ pub fn run() {
                 println!("option name MoveOverhead type spin default 20 min 0 max 5000");
                 println!("option name Clear Hash type button");
                 println!("option name UseNNUE type check default true");
+                println!("option name ResidualCap type spin default 400 min 0 max 3000");
                 println!("uciok");
             }
             "isready" => {
@@ -119,6 +120,11 @@ pub fn run() {
                             }
                         }
                         "Clear Hash" => engine.tt.clear(),
+                        "ResidualCap" => {
+                            if let Some(v) = value.and_then(|v| v.parse::<i32>().ok()) {
+                                crate::eval::set_delta_cap(v);
+                            }
+                        }
                         "UseNNUE" => {
                             if let Some(v) = value {
                                 crate::nnue::set_enabled(v.eq_ignore_ascii_case("true"));
