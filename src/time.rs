@@ -110,15 +110,24 @@ impl TimeManager {
         !self.infinite && self.elapsed() >= self.hard
     }
 
-    pub fn soft_expired(&self, stable: bool) -> bool {
+    /// True when the budget came from a game clock (wtime/btime). With
+    /// `movetime`, soft == hard and must never be scaled.
+    #[inline]
+    pub fn is_clocked(&self) -> bool {
+        !self.infinite && self.soft < self.hard
+    }
+
+    /// Stop-between-iterations test. `scale` multiplies the soft budget
+    /// (clamped to the hard budget); ignored for fixed movetime.
+    pub fn soft_expired_scaled(&self, scale: f64) -> bool {
         if self.infinite {
             return false;
         }
         let e = self.elapsed();
-        if stable {
-            e >= self.soft
-        } else {
-            e >= self.soft.saturating_mul(3) / 2 && e >= self.soft
+        if !self.is_clocked() {
+            return e >= self.soft;
         }
+        let limit = self.soft.mul_f64(scale.clamp(0.4, 3.0)).min(self.hard / 2);
+        e >= limit
     }
 }
