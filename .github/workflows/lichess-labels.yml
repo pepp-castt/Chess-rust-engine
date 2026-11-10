@@ -1,0 +1,120 @@
+name: lichess-labels
+
+# Bulk Stockfish labels from the CC0 Lichess evaluation database (Agent X).
+# Labels are never played, so no engine games and no time-control floor are involved here.
+# Output: 28-byte CRN1 records (tools/nnue/train.py format), score = side-to-move POV, wdl invalid
+# => always train with --lam 1.0.  Shards read DISJOINT line ranges (skip = k*L, max-lines = L).
+# Optional `train` job uses upstream train.py unchanged and uploads the net as an artifact ONLY.
+# A net from this workflow is a candidate: it must still pass the fixed-nodes screen and the
+# SPRT gate vs HCE before anything is merged.
+
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: parallel shards (each a disjoint slice of the database)
+        default: "2"
+      positions_per_shard:
+        description: kept records per shard (about 1/3 of lines survive the filters)
+        default: "300000"
+      min_depth:
+        description: minimum Stockfish depth of the label
+        default: "24"
+      train:
+        description: also train a net on the merged shards (CPU PyTorch, upstream train.py)
+        type: boolean
+        default: false
+      train_minutes:
+        description: trainer wall-clock budget
+        default: "5"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        run: echo "matrix=$(python3 -c 'import json;print(json.dumps(list(range(int("${{ inputs.shards }}")))))')" >> "$GITHUB_OUTPUT"
+
+  label:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: archanapriyadarshini1st-debug/Chess-rust-engine
+          ref: main
+          path: upstream
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install zstandard numpy python-chess
+      - name: Unit tests (perspective, filters, pack == python-chess reference)
+        if: ${{ matrix.shard == 0 }}
+        run: python tools/nnue/test_lichess_eval.py
+      - name: Convert shard ${{ matrix.shard }}
+        run: |
+          P=${{ inputs.positions_per_shard }}
+          L=$(( P * 3 ))
+          python tools/nnue/lichess_eval_to_bin.py \
+            --out data/lichess-s${{ matrix.shard }}.bin \
+            --max-positions "$P" --max-lines "$L" --skip-lines $(( ${{ matrix.shard }} * L )) \
+            --min-depth ${{ inputs.min_depth }}
+      - name: Audit shard
+        run: |
+          python upstream/tools/nnue/data_audit.py data/lichess-s${{ matrix.shard }}.bin \
+            --manifest data/manifest-s${{ matrix.shard }}.json \
+            --provenance teacher=lichess-eval-db-stockfish min_depth=${{ inputs.min_depth }} wdl_valid=false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lichess-shard-${{ matrix.shard }}
+          path: data/*
+
+  train:
+    if: ${{ inputs.train }}
+    needs: label
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: archanapriyadarshini1st-debug/Chess-rust-engine
+          ref: main
+          path: upstream
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          pip install numpy
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lichess-shard-*
+          merge-multiple: true
+          path: data
+      - name: Audit merged data
+        run: |
+          python upstream/tools/nnue/data_audit.py 'data/*.bin' --manifest data/manifest.json \
+            --provenance teacher=lichess-eval-db-stockfish min_depth=${{ inputs.min_depth }} wdl_valid=false
+      - name: Train (score-only, lam 1.0)
+        run: |
+          mkdir -p nets
+          python upstream/tools/nnue/train.py --data 'data/*.bin' --lam 1.0 \
+            --minutes ${{ inputs.train_minutes }} --out nets/lichess-candidate.nnue 2>&1 | tee nets/train.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lichess-candidate-net
+          path: |
+            nets/lichess-candidate.nnue
+            nets/train.log
+            data/manifest.json
