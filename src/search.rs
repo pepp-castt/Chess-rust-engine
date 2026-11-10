@@ -47,6 +47,8 @@ pub struct ThreadData {
     pub ply_move: [Move; MAX_PLY],
     /// pawn-corrhist [stm][pawn_key % CORR_N]
     pub corr: Vec<i16>,
+    /// nodes spent under each root move (from*64+to), for time management
+    pub root_nodes: Vec<u64>,
 }
 
 const HIST_MAX: i32 = 16384;
@@ -99,6 +101,7 @@ impl ThreadData {
             counter: [[Move::NONE; 64]; 64],
             ply_move: [Move::NONE; MAX_PLY],
             corr: vec![0; 2 * CORR_N],
+            root_nodes: vec![0; 64 * 64],
         }
     }
 
@@ -595,6 +598,7 @@ fn search(
         td.stack_pc[ply as usize] = pos.piece_on(mv.from()).index() as u8;
         td.stack_to[ply as usize] = mv.to().index() as u8;
         td.ply_move[ply as usize] = mv;
+        let nodes_before = td.nodes;
 
         let mut score;
         if legal == 1 {
@@ -639,6 +643,9 @@ fn search(
         }
 
         td.hash_hist.pop();
+        if ply == 0 {
+            td.root_nodes[mv.from().index() * 64 + mv.to().index()] += td.nodes - nodes_before;
+        }
         if td.time.stopped() {
             return 0;
         }
@@ -724,6 +731,7 @@ pub struct SearchResult {
 pub fn iterative_deepening(pos: &Position, td: &mut ThreadData, use_book: bool) -> SearchResult {
     td.tt.new_search();
     td.nodes = 0;
+    td.root_nodes.iter_mut().for_each(|x| *x = 0);
     td.best = Move::NONE;
     if use_book {
         if let Some(mv) = crate::book::probe(pos) {
@@ -747,6 +755,7 @@ pub fn iterative_deepening(pos: &Position, td: &mut ThreadData, use_book: bool) 
     let mut last_pv: Vec<Move> = Vec::new();
     let mut last_depth = 0;
     let mut stable = 0;
+    let mut prev_score = 0;
 
     let mut root_moves = [Move::NONE; MAX_MOVES];
     let rn = legal_moves(pos, &mut root_moves);
@@ -841,7 +850,28 @@ pub fn iterative_deepening(pos: &Position, td: &mut ThreadData, use_book: bool) 
         } else {
             stable = 0;
         }
-        if td.time.soft_expired(stable >= 4) {
+        // Time scaling (Stockfish / Reckless idea): spend less when one root
+        // move absorbs nearly all the nodes and stays best, more when the best
+        // move keeps changing or the score is falling.
+        let mut scale = [1.45, 1.25, 1.10, 1.0, 0.90][stable.min(4) as usize];
+        if depth >= 8 && td.nodes > 0 && !td.best.is_none() {
+            let frac = td.root_nodes[td.best.from().index() * 64 + td.best.to().index()] as f64
+                / td.nodes as f64;
+            scale *= if frac >= 0.93 {
+                0.76
+            } else if frac >= 0.80 {
+                0.90
+            } else if frac < 0.45 {
+                1.12
+            } else {
+                1.0
+            };
+        }
+        if depth >= 6 && score < prev_score - 10 {
+            scale *= 1.0 + ((prev_score - score - 10) as f64 / 120.0).min(0.6);
+        }
+        prev_score = score;
+        if td.time.soft_expired_scaled(scale) {
             break;
         }
         if td.nodes >= td.time.max_nodes {
