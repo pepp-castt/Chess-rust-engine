@@ -113,13 +113,21 @@ impl TranspositionTable {
         let old_data = e.data.load(Ordering::Relaxed);
         let old_key = e.key.load(Ordering::Relaxed);
         let age = self.age.load(Ordering::Relaxed);
-        let replace = if old_key ^ old_data == hash {
+        let same = old_key ^ old_data == hash;
+        let replace = if same {
             let (_, _, old_depth, _, old_age) = unpack(old_data);
             depth + 2 >= old_depth || old_age != age
         } else {
             true
         };
         if replace {
+            // Stockfish/Reckless behaviour: a fail-low or qsearch store has no
+            // best move; keep the move already known for this exact position
+            // so move ordering (and singular extension) does not lose it.
+            let mut mv = mv;
+            if same && mv.is_none() {
+                mv = unpack(old_data).0;
+            }
             let data = pack(mv, score, depth, bound, age);
             e.data.store(data, Ordering::Relaxed);
             e.key.store(hash ^ data, Ordering::Relaxed);
