@@ -1,0 +1,189 @@
+name: Lichess bulk NNUE
+
+# Agent R. Volume test for the NNUE wall.
+#
+# Every net so far was trained on <= 1M positions and lost ~90% to the HCE. Hypothesis (open, not
+# proven): the data is 1-2 orders of magnitude too small. This workflow trains the SAME trainer
+# (tools/nnue/train.py, H=128, 8 buckets) on millions of Stockfish-labelled positions from the CC0
+# Lichess evaluation database (depth 20+, MultiPV, best PV kept), then plays the SAME gate as
+# everyone else (tools/gate_net.sh: net vs HCE, same binary, 10+0.1, book, colours reversed).
+#
+# Stages:  plan -> convert (matrix, one shard per job) -> train (--lam 1.0, no game results exist)
+#          -> gate (net vs HCE).   Keep/revert on the GATE only, never on val loss.
+#
+# The labels are NOT from the pinned SF19 (they are various SF versions run in Lichess browsers).
+# That is stated in every provenance sidecar. SF19 MAX remains the benchmark opponent and the
+# source for stage-2 fine-tuning (nnue-finetune.yml) on top of this pretrain.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/SHA to build (engine + tools)"
+        default: ""
+      shards:
+        description: "Lichess data_NNNN shard indexes 0..19, comma separated (each ~10M quiet positions)"
+        default: "0,1"
+      max_out:
+        description: "Max records per shard (0 = whole shard)"
+        default: "8000000"
+      min_depth:
+        description: "Drop labels shallower than this SF depth"
+        default: "20"
+      train_minutes:
+        description: "Wall-clock minutes of training"
+        default: "150"
+      gate_games:
+        description: "Games for net-vs-HCE gate (colours reversed)"
+        default: "100"
+      gate_tc:
+        description: "Gate time control"
+        default: "10+0.1"
+
+env:
+  FASTCHESS_URL: https://github.com/Disservin/fastchess/releases/download/v1.8.3-alpha/fastchess-linux-x86-64.tar
+  HF_BASE: https://huggingface.co/datasets/Lichess/chess-position-evaluations/resolve/main/data
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.p.outputs.shards }}
+    steps:
+      - id: p
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          raw = "${{ inputs.shards }}"
+          s = [int(x) for x in re.split(r"[,\s]+", raw.strip()) if x != ""]
+          assert s and all(0 <= x <= 19 for x in s), f"bad shards {raw!r}"
+          print("shards=" + json.dumps(sorted(set(s))))
+          PY
+
+  convert:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyarrow python-chess numpy
+      - name: "Converter self-test (packer vs datagen_movetime.pack, in_check vs python-chess)"
+        run: python3 tools/nnue/lichess_to_records.py --selftest
+      - name: Download shard
+        run: |
+          N=$(printf '%04d' ${{ matrix.shard }})
+          curl -fL --retry 6 --retry-delay 10 -o /tmp/shard.parquet "$HF_BASE/data_$N.parquet"
+          ls -la /tmp/shard.parquet
+      - name: "Score-perspective guard (cp must be White-POV)"
+        run: python3 tools/nnue/lichess_pov_check.py /tmp/shard.parquet 100000 | tee /tmp/pov.txt && grep -q "WHITE-POV" /tmp/pov.txt
+      - name: Convert
+        run: |
+          N=$(printf '%04d' ${{ matrix.shard }})
+          mkdir -p out
+          python3 tools/nnue/lichess_to_records.py --in /tmp/shard.parquet --out out/lichess_$N.bin \
+            --min-depth ${{ inputs.min_depth }} --max-out ${{ inputs.max_out }} --seed ${{ matrix.shard }} \
+            | tail -40
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lichess-${{ matrix.shard }}
+          path: out/
+          retention-days: 7
+          compression-level: 3
+
+  train:
+    needs: convert
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lichess-*
+          path: data
+          merge-multiple: true
+      - name: Install trainer deps
+        run: |
+          pip install numpy chess
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Data summary
+        run: |
+          ls -la data
+          python3 - <<'PY' | tee data_summary.txt
+          import glob, json
+          tot = 0
+          for f in sorted(glob.glob("data/*.json")):
+              o = json.load(open(f))
+              tot += o["records"]
+              print(o["source_file"], o["records"], o["stats"])
+          print("total records", tot)
+          PY
+      - name: "Train (lam=1.0, Lichess data has no game results)"
+        run: |
+          python3 tools/nnue/train.py --data 'data/*.bin' --out net.bin --lam 1.0 \
+            --minutes ${{ inputs.train_minutes }} 2>&1 | tee train.log | grep -E "files|decoded|==|final|exported" | tail -80
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lichess-net
+          path: |
+            net.bin
+            net.bin.parity.txt
+            train.log
+            data_summary.txt
+          retention-days: 30
+
+  gate:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: lichess-net
+          path: net
+      - name: Build engine + fastchess
+        run: |
+          cargo build --release
+          cp target/release/chess-rust-engine ./engine
+          echo "bench: $(timeout 180 ./engine bench 8 | tail -1)"
+          mkdir -p /tmp/fc
+          curl -fsSL --retry 3 "$FASTCHESS_URL" -o /tmp/fc.tar && tar xf /tmp/fc.tar -C /tmp/fc
+          FC=$(find /tmp/fc -type f -name fastchess | head -1); chmod +x "$FC"; ln -sf "$FC" /tmp/fastchess
+      - name: "Gate: net vs HCE (same binary), colours reversed"
+        run: |
+          FASTCHESS=/tmp/fastchess bash tools/gate_net.sh ./engine net/net.bin ${{ inputs.gate_games }} "${{ inputs.gate_tc }}" 3 gate_out
+      - name: Summary
+        run: |
+          {
+            echo "## Lichess-bulk net vs HCE  (run ${{ github.run_id }})"
+            echo '```'
+            cat net/data_summary.txt | tail -4
+            grep -E "== |exported" net/train.log | tail -6
+            tail -n 14 gate_out/gate.log
+            cat gate_out/config.txt
+            echo '```'
+            echo "Keep/revert on this gate only. Val loss is not Elo."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lichess-gate
+          path: gate_out/
+          retention-days: 30
