@@ -10,6 +10,7 @@
 //!
 //! Net file (little endian): `"CRN1" | version u32 | hidden u32 | buckets u32 | features u32`
 //! then `ft_w i16[768*H] | ft_b i16[H] | out_w i16[B*2H] | out_b i32[B]`.
+//! `version = 2` marks a residual net (output is added to the HCE score, see `eval::evaluate`).
 //! An empty / invalid net => HCE fallback. `CRE_NNUE_FILE` overrides the embedded net.
 
 use crate::board::Position;
@@ -35,6 +36,10 @@ pub struct Network {
     out_w: Vec<i16>,
     out_b: Vec<i32>,
     avx2: bool,
+    /// Header `version == 2`: the net outputs a *correction* that is added to the
+    /// hand-crafted eval (`eval::evaluate`), instead of replacing it. A zero-output net is then
+    /// exactly HCE, so a bad/untrained residual net cannot fall off a cliff.
+    pub residual: bool,
 }
 
 fn rd_u32(b: &[u8], at: usize) -> u32 {
@@ -51,6 +56,10 @@ impl Network {
             rd_u32(bytes, 12) as usize,
             rd_u32(bytes, 16) as usize,
         );
+        let version = rd_u32(bytes, 4);
+        if version != 1 && version != 2 {
+            return Err(format!("unsupported net version {version}"));
+        }
         if h != HIDDEN || b != BUCKETS || f != FEATURES {
             return Err(format!("net shape {f}x{h} b{b} != built-in {FEATURES}x{HIDDEN} b{BUCKETS}"));
         }
@@ -76,7 +85,7 @@ impl Network {
         let avx2 = is_x86_feature_detected!("avx2");
         #[cfg(not(target_arch = "x86_64"))]
         let avx2 = false;
-        Ok(Network { ft_w, ft_b, out_w, out_b, avx2 })
+        Ok(Network { ft_w, ft_b, out_w, out_b, avx2, residual: version == 2 })
     }
 
     #[inline(always)]
