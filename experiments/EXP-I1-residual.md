@@ -85,3 +85,41 @@ python tools/nnue/diagnose_residual.py --data data/teacher.bin --net resid.bin
 FASTCHESS=fastchess tools/nnue/gate_vs_hce.sh target/release/chess-rust-engine resid.bin 60 nodes=25000 4 150 gate
 ```
 Caveats: one net, one seed, one dataset; fixed-nodes games are not time-control Elo; no claim about any other net.
+
+---
+
+# EXP-I2 (follow-up, pre-registered on issue #1): more data, game-level validation, early stopping - NEGATIVE
+
+Rule: retrain on ~10x more diverse data with a game-level split and early stopping; **KEEP only if some cap scores >= 52% over >= 240 games**, else stop.
+
+Data: 1,000,000 positions from the engine's own depth-6 self-play (4 shards, distinct `CRE_SEED`, 864,039 unique; HCE vs
+label MAE 63 cp, corr 0.980 - the labels are the engine's own search, so the residual can only learn what depth-6 search
+adds over the static eval). New trainer options: `--split-block 4096` (validation = whole blocks of consecutive records, so no
+game is split across train/val), `--val-every`, `--wd`. Validation 60,837 positions, 5% of blocks.
+
+## The leak, measured
+| run | split | lr | held-out loss vs HCE |
+|---|---|---|---|
+| EXP-I1 (348k SF19 positions) | per-position hash (neighbours of one game on both sides) | 2e-3 | **-71.9%** (looked superb) |
+| EXP-I2a (1M self-play) | **per game block** | 2e-3 | **+23% to +33% WORSE** than HCE, getting worse each minute while train loss falls |
+| EXP-I2b (same data) | per game block | 2e-4, AdamW wd 0.05, validate/10 s | best **+6.74%** at ~1 min, then overfits (+2.7% by 3.8 min) |
+
+Position-level splitting on game-ordered data is leaky; with an honest split, the same recipe is *worse than doing nothing*
+at the usual learning rate and only just positive when regularised. (EXP-I1 and I2 differ in data source, so the leak is
+strongly suggested, not isolated by a controlled A/B on identical data.)
+
+## Fixed-nodes screen (25,000 nodes/move, 60 rounds x 2 = 120 games per row, same book, colours reversed), net = I2b best-val
+| `ResidualCap` | W-D-L | score | Elo (95% CI) |
+|---|---|---|---|
+| 400 (mean abs delta 91 cp, p95 262 cp on val) | 23-28-69 | 30.8% | -140 (-202..-86) |
+| 150 | 23-23-74 | 28.7% | -158 (-223..-101) |
+
+## Verdict: **REVERT** (rule failed: no cap near 52%). Infrastructure stays; no net is shipped.
+Observations: an honest held-out gain of +6.7% in loss still plays ~-150 Elo at equal nodes, and (unlike I1) the damage is
+not monotone in the cap between 150 and 400. So even a *small genuine* loss gain does not translate to search strength
+here. Not tested, ranked by my guess: (a) leaf distribution (search selects the leaf where the net is most wrong; training positions are game positions, not
+search leaves); (b) the net perturbs eval scale/margins used by pruning (RFP/futility/LMR are tuned to HCE); (c) correction noise at
+non-quiet nodes. A fixed-depth/fixed-nodes comparison of `eval` on *search leaves* (dump leaves, label with deeper search) is the
+next honest experiment, and needs search-side logging in `search.rs` (A's file) that I did not touch.
+
+Caveats: one seed per recipe; I2b is one regularisation setting; fixed-node results are not time-control Elo; no claim about nets trained any other way.
