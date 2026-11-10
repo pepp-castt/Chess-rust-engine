@@ -66,6 +66,11 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--lam", type=float, default=0.75, help="weight of search/SF score vs game result")
     ap.add_argument("--val-mod", type=int, default=50)
+    ap.add_argument("--split-block", type=int, default=0,
+                    help="if >0, validation = whole blocks of N consecutive records (so games are not split across train/val); "
+                         "records must be in game order (datagen output is). 0 = per-position hash (leaky for adjacent positions)")
+    ap.add_argument("--val-every", type=float, default=60, help="seconds between validations (early stopping granularity)")
+    ap.add_argument("--wd", type=float, default=0.0, help="AdamW weight decay")
     ap.add_argument("--min-gain", type=float, default=0.0, help="required relative val-loss gain over HCE to export")
     ap.add_argument("--threads", type=int, default=os.cpu_count() or 2)
     a = ap.parse_args()
@@ -75,6 +80,9 @@ def main():
     _, first = np.unique(h, return_index=True); first.sort()
     recs, hce, h = recs[first], hce[first], h[first]
     is_val = (h % np.uint64(a.val_mod)) == 0
+    if a.split_block > 0:
+        blk = (first // a.split_block).astype(np.uint64)
+        is_val = (((blk * np.uint64(0x9E3779B97F4A7C15)) >> np.uint64(33)) % np.uint64(a.val_mod)) == 0
     vi, ti = np.nonzero(is_val)[0], np.nonzero(~is_val)[0]
     rng = np.random.default_rng(1); rng.shuffle(ti)
     print(f"files={len(files)} unique={len(recs)} train={len(ti)} val={len(vi)}", flush=True)
@@ -103,7 +111,7 @@ def main():
     net = ResNet()
     base = val_loss(net)  # delta == 0  ->  pure HCE
     print(f"== HCE-only held-out loss {base:.5f}   (net must beat this)", flush=True)
-    opt = torch.optim.Adam(net.parameters(), lr=a.lr)
+    opt = torch.optim.AdamW(net.parameters(), lr=a.lr, weight_decay=a.wd)
     n, spe = len(TA), max(1, len(TA) // a.batch)
     t0, budget, step, best, done = time.time(), a.minutes * 60, 0, (base, None), False
     last_val = t0
@@ -119,7 +127,7 @@ def main():
             o = net(TA[idx].long(), TB[idx].long(), TK[idx])
             loss = ((torch.sigmoid(TH[idx] / SCALE + o) - tgt(TS[idx], TW[idx])) ** 2).mean()
             opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); net.clip(); step += 1
-            if time.time() - last_val > 60:
+            if time.time() - last_val > a.val_every:
                 last_val = time.time(); v = val_loss(net)
                 print(f"step {step} train {loss.item():.5f} val {v:.5f} (HCE {base:.5f}, gain {100*(base-v)/base:+.2f}%) {(time.time()-t0)/60:.1f}m", flush=True)
                 if v < best[0]:
