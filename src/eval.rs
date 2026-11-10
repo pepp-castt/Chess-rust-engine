@@ -125,11 +125,36 @@ fn pst_index(color: Color, sq: Square) -> usize {
 #[inline]
 pub fn evaluate(pos: &Position) -> i32 {
     if crate::nnue::enabled() {
-        if let Some(v) = crate::nnue::evaluate(pos) {
+        if let Some(n) = crate::nnue::net() {
+            let v = n.eval(pos);
+            if n.residual {
+                // HCE-anchored correction net: HCE + clamp(net). CRE_DELTA_CAP bounds the damage.
+                let cap = delta_cap();
+                return evaluate_hce(pos) + v.clamp(-cap, cap);
+            }
             return v;
         }
     }
     evaluate_hce(pos)
+}
+
+static DELTA_CAP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Max |correction| (cp) a residual (version 2) net may add to HCE. UCI `ResidualCap`
+/// overrides; `CRE_DELTA_CAP` is the initial value; default 400.
+pub fn delta_cap() -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = DELTA_CAP.load(Relaxed);
+    if v >= 0 {
+        return v;
+    }
+    let init = std::env::var("CRE_DELTA_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+    DELTA_CAP.store(init, Relaxed);
+    init
+}
+
+pub fn set_delta_cap(cap: i32) {
+    DELTA_CAP.store(cap.clamp(0, 3000), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Hand-crafted eval (PeSTO + structure). Used when no NNUE net is loaded
