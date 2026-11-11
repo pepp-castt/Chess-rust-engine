@@ -19,3 +19,7 @@ jobs:
         run: cargo build --release
       - name: Bench smoke
         run: ./target/release/chess-rust-engine bench 4
+      - name: NNUE train/inference parity (random net, engine vs trainer decode vs float reference)
+        run: |
+          python3 -m pip install --quiet numpy python-chess
+          python3 tools/nnue/parity_check.py --engine ./target/release/chess-rust-engine --n 400

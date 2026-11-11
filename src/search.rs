@@ -1,6 +1,7 @@
 //! Fail-soft PVS with the pruning / ordering stack used by Reckless, Viridithas
 //! and Stockfish. Conservative margins first; tune on OpenBench (see ROADMAP).
 
+use crate::params;
 use crate::board::Position;
 use crate::eval::evaluate;
 use crate::movegen::{legal_moves, noisy_moves, pseudo_legal};
@@ -45,18 +46,9 @@ pub struct ThreadData {
     pub root_depth: i32,
     pub counter: [[Move; 64]; 64],
     pub ply_move: [Move; MAX_PLY],
-    /// pawn-corrhist [stm][pawn_key % CORR_N]
-    pub corr: Vec<i16>,
 }
 
 const HIST_MAX: i32 = 16384;
-const CORR_N: usize = 16384;
-
-#[inline]
-fn pawn_corr_idx(pos: &Position) -> usize {
-    let p = pos.bb(pos.side, PieceType::Pawn) ^ pos.bb(pos.side.flip(), PieceType::Pawn).rotate_left(17);
-    pos.side.index() * CORR_N + ((p as usize) ^ ((p >> 32) as usize)) % CORR_N
-}
 
 #[inline]
 fn cont_idx(pp: usize, pt: usize, pc: usize, to: usize) -> usize {
@@ -98,8 +90,30 @@ impl ThreadData {
             root_depth: 0,
             counter: [[Move::NONE; 64]; 64],
             ply_move: [Move::NONE; MAX_PLY],
-            corr: vec![0; 2 * CORR_N],
         }
+    }
+
+    /// Keep butterfly / capture / continuation / counter history across `go`
+    /// commands of one game. Stockfish and Reckless only clear those on
+    /// `ucinewgame`; we were throwing them away every move. Agent N measured
+    /// this independently (EXP-N1). Scratch (killers, PV, stacks, nodes) resets.
+    pub fn prepare(&mut self, tt: Arc<TranspositionTable>, time: Arc<TimeManager>) {
+        self.tt = tt;
+        self.time = time;
+        self.nodes = 0;
+        self.seldepth = 0;
+        self.killers = [[Move::NONE; 2]; MAX_PLY];
+        self.pv = [[Move::NONE; MAX_PLY]; MAX_PLY];
+        self.pv_len = [0; MAX_PLY];
+        self.eval_stack = [0; MAX_PLY];
+        self.best = Move::NONE;
+        self.score = 0;
+        self.check_nodes = 0;
+        self.stack_pc = [12; MAX_PLY];
+        self.stack_to = [0; MAX_PLY];
+        self.root_depth = 0;
+        self.ply_move = [Move::NONE; MAX_PLY];
+        self.hash_hist.clear();
     }
 
     #[inline]
@@ -338,6 +352,7 @@ fn qsearch(pos: &Position, td: &mut ThreadData, mut alpha: i32, beta: i32, ply: 
         if np.was_illegal() {
             continue;
         }
+        td.tt.prefetch(np.hash);
         td.hash_hist.push(pos.hash);
         let score = -qsearch(&np, td, -beta, -alpha, ply + 1);
         td.hash_hist.pop();
@@ -428,16 +443,14 @@ fn search(
         }
     }
 
-    let raw_eval = if in_check {
+    // Pawn corrhist from PR #5 is *not* applied. `static_eval += corr/32`
+    // saturates at ±512 cp (gravity uses HIST_MAX=16384), poisons RFP/NMP, and
+    // scored 12.5% vs SF19 UCI_Elo 2400 against 69% with this line gone and
+    // 71% on 451d933 (pre-#5). Re-add only with a SPRT vs this baseline.
+    let static_eval = if in_check {
         -INF
     } else {
         evaluate(pos)
-    };
-    let corr_i = pawn_corr_idx(pos);
-    let static_eval = if in_check {
-        raw_eval
-    } else {
-        raw_eval + (td.corr[corr_i] as i32) / 32
     };
     td.eval_stack[ply as usize] = static_eval;
     let improving = ply >= 2
@@ -448,8 +461,8 @@ fn search(
     if excluded.is_none()
         && !is_pv
         && !in_check
-        && depth <= 8
-        && static_eval - 70 * depth + (if improving { 40 } else { 0 }) >= beta
+        && depth <= params::rfp_depth()
+        && static_eval - params::rfp_margin() * depth + (if improving { params::rfp_improving() } else { 0 }) >= beta
         && static_eval.abs() < MATE_IN_MAX_LOCAL
     {
         return static_eval;
@@ -464,7 +477,7 @@ fn search(
         && pos.bb(pos.side, PieceType::Pawn) != pos.colors[pos.side.index()] ^ pos.bb(pos.side, PieceType::King)
         && !(tt_hit && tt_bound == BOUND_UPPER && tt_score < beta)
     {
-        let r = 3 + depth / 4 + ((static_eval - beta) / 200).clamp(0, 3);
+        let r = params::nmp_base() + depth / params::nmp_depth_div() + ((static_eval - beta) / params::nmp_eval_div()).clamp(0, 3);
         let mut np = *pos;
         // make null
         if let Some(ep) = np.ep {
@@ -505,7 +518,7 @@ fn search(
         && tt_bound != BOUND_UPPER
         && tt_score.abs() < MATE_IN_MAX_LOCAL
     {
-        let rbeta = (tt_score - (40 + depth)).max(-MATE_IN_MAX_LOCAL);
+        let rbeta = (tt_score - (params::se_margin() + depth)).max(-MATE_IN_MAX_LOCAL);
         let sdepth = ((depth - 1) / 2).max(1);
         let s = search(pos, td, rbeta - 1, rbeta, sdepth, ply, false, cut_node, tt_move);
         if td.time.stopped() {
@@ -547,20 +560,20 @@ fn search(
             && is_quiet
             && legal > 0
             && depth <= 7
-            && legal >= 4 + depth * depth / if improving { 1 } else { 2 }
+            && legal >= params::lmp_base() + depth * depth / if improving { 1 } else { 2 }
         {
             continue;
         }
 
         // History pruning of quiets that have consistently failed
         let mv_hist = if is_quiet { quiet_hist(td, pos, mv, ply as usize) } else { 0 };
-        if !is_pv && !in_check && is_quiet && legal > 0 && depth <= 4 && mv_hist < -2500 * depth {
+        if !is_pv && !in_check && is_quiet && legal > 0 && depth <= 4 && mv_hist < -params::hist_prune() * depth {
             continue;
         }
 
         // SEE pruning of bad captures / quiets
         if !is_pv && !in_check && legal > 0 && depth <= 6 {
-            let th = if is_quiet { -20 * depth } else { -100 * depth };
+            let th = if is_quiet { -params::see_quiet() * depth } else { -params::see_capture() * depth };
             if !see_ge(pos, mv, th) {
                 continue;
             }
@@ -570,8 +583,8 @@ fn search(
         if !is_pv
             && !in_check
             && is_quiet
-            && depth <= 6
-            && static_eval + 120 * depth < alpha
+            && depth <= params::futility_depth()
+            && static_eval + params::futility_margin() * depth < alpha
             && legal > 0
         {
             continue;
@@ -582,6 +595,7 @@ fn search(
         if np.was_illegal() {
             continue;
         }
+        td.tt.prefetch(np.hash);
         legal += 1;
         let gives_check = np.in_check();
 
@@ -616,7 +630,7 @@ fn search(
                 if gives_check {
                     r = r.saturating_sub(1);
                 }
-                r -= mv_hist / 6000;
+                r -= mv_hist / params::lmr_hist_div();
                 r = r.clamp(0, new_depth - 1);
             }
             score = -search(
@@ -696,10 +710,6 @@ fn search(
 
     if excluded.is_none() {
         td.tt.store(pos.hash, best_move, to_tt(best, ply), depth, bound);
-        if !in_check && ply > 0 && !is_mate_score(best) {
-            let diff = (best - raw_eval).clamp(-400, 400);
-            gravity(&mut td.corr[corr_i], diff * depth / 8);
-        }
     }
     best
 }
@@ -708,7 +718,7 @@ fn lmr_reduction(depth: i32, move_no: i32) -> i32 {
     // ln(depth)*ln(move_no) style table, integer approx
     let d = depth.max(1) as f32;
     let m = move_no.max(1) as f32;
-    ((d.ln() * m.ln()) * 0.45) as i32
+    ((d.ln() * m.ln()) * (params::lmr_scale() as f32 / 100.0)) as i32
 }
 
 const MATE_IN_MAX_LOCAL: i32 = crate::types::MATE_IN_MAX;
@@ -766,7 +776,7 @@ pub fn iterative_deepening(pos: &Position, td: &mut ThreadData, use_book: bool) 
         td.root_depth = depth;
         let mut alpha = -INF;
         let mut beta = INF;
-        let mut window = 25;
+        let mut window = params::asp_window();
         if depth >= 5 {
             alpha = last_score - window;
             beta = last_score + window;

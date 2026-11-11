@@ -1,0 +1,174 @@
+name: SPSA search tuner
+
+# Tunes the search parameters in src/params.rs by SPSA (tools/spsa.py).
+#
+# THIS IS A TRAINING SIGNAL, NOT A VERDICT. The tuned values are printed as a
+# ready-to-paste `test_opts` string; they only get merged after sprt.yml
+# (TEST = same commit + tuned options, BASE = same commit) accepts H1.
+#
+#   Dispatch:  ref=<branch/sha containing src/params.rs>
+#   Resume:    resume_run_id=<earlier spsa run id>  (state travels as an artifact;
+#              each job is capped at ~5.5h by GitHub, so long tunes are chained)
+#
+# Time-control floor is 5+0.05 (same as sprt.yml). Never lower it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch / SHA to tune (must contain src/params.rs)"
+        default: "main"
+      iterations:
+        description: "Total SPSA iterations (schedule is defined over this number; keep it fixed when resuming)"
+        default: "500"
+      rounds:
+        description: "Rounds per iteration (each = 2 games, colours swapped)"
+        default: "4"
+      tc:
+        description: "Time control (floor 5+0.05)"
+        default: "5+0.05"
+      only:
+        description: "Comma list of parameter names to tune (empty = all)"
+        default: ""
+      r_mult:
+        description: "Multiplier on r_end (see tools/spsa.py --r-mult)"
+        default: "8"
+      concurrency:
+        description: "Parallel games (runner has 4 vCPU; 3 keeps timing honest)"
+        default: "3"
+      budget_min:
+        description: "Stop gracefully after this many minutes (state is saved for resume)"
+        default: "330"
+      resume_run_id:
+        description: "Run id of a previous SPSA run to resume from (empty = fresh)"
+        default: ""
+      seed:
+        default: "1"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: spsa-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  FASTCHESS_URL: https://github.com/Disservin/fastchess/releases/download/v1.8.3-alpha/fastchess-linux-x86-64.tar
+
+jobs:
+  spsa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          path: test
+
+      # Tuner + book come from the workflow's own ref, never from the code under
+      # tune, so any commit that has params.rs can be tuned.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: harness
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate time control
+        env:
+          TC: ${{ inputs.tc }}
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          tc = os.environ["TC"]
+          base, _, inc = tc.partition("+")
+          b = float(base.split("/")[-1]); i = float(inc or 0)
+          if b < 5 or (b + 40 * i) < 7:
+              sys.exit(f"refusing tc {tc}: floor is 5+0.05")
+          print("tc ok:", tc)
+          PY
+
+      - name: Build engine
+        run: |
+          cd test
+          test -f src/params.rs || { echo "ref has no src/params.rs"; exit 1; }
+          RUSTFLAGS="-C target-cpu=native" cargo build --release
+          cp target/release/chess-rust-engine ../engine
+          cd ..
+          echo "bench 10:"; timeout 120 ./engine bench 10 | tail -1
+          echo "SPSA spec:"; printf 'params\nquit\n' | ./engine
+
+      - name: fastchess
+        run: |
+          mkdir -p /tmp/fc && curl -fsSL --retry 3 "$FASTCHESS_URL" -o /tmp/fc.tar
+          tar xf /tmp/fc.tar -C /tmp/fc
+          FC=$(find /tmp/fc -type f -name fastchess | head -1)
+          chmod +x "$FC"; ln -sf "$FC" /tmp/fastchess; /tmp/fastchess --version
+
+      - name: Fetch state of previous run
+        if: ${{ inputs.resume_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p prev
+          gh run download "${{ inputs.resume_run_id }}" --repo "${{ github.repository }}" \
+            --name "spsa-${{ inputs.resume_run_id }}" --dir prev
+          ls -l prev
+          cp prev/spsa_state.json spsa_state.json
+
+      - name: SPSA
+        env:
+          ITER: ${{ inputs.iterations }}
+          ROUNDS: ${{ inputs.rounds }}
+          TC: ${{ inputs.tc }}
+          ONLY: ${{ inputs.only }}
+          RMULT: ${{ inputs.r_mult }}
+          CONC: ${{ inputs.concurrency }}
+          BUDGET: ${{ inputs.budget_min }}
+          SEED: ${{ inputs.seed }}
+        run: |
+          python3 harness/tools/spsa.py \
+            --engine "$PWD/engine" --fastchess /tmp/fastchess \
+            --book harness/tools/openings_book.epd \
+            --iterations "$ITER" --rounds "$ROUNDS" --tc "$TC" --concurrency "$CONC" \
+            --r-mult "$RMULT" --seed "$SEED" --time-budget-min "$BUDGET" \
+            --only "$ONLY" --state spsa_state.json --out spsa_result.json \
+            2>&1 | tee spsa.log
+
+      - name: Summary
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          try:
+              r = json.load(open("spsa_result.json"))
+          except Exception as e:
+              print("## SPSA: no result", e); raise SystemExit
+          w, l, d = r["plus_minus_wld"]
+          print("## SPSA result (training signal, NOT a verdict)")
+          print(f"- iterations done: **{r['iterations_done']}**, games: **{r['games_total']}** (plus {w} / minus {l} / draws {d})")
+          print(f"- ref: `${{ inputs.ref }}`  tc: `${{ inputs.tc }}`  r_mult: `${{ inputs.r_mult }}`")
+          print()
+          print("| param | default | tuned |")
+          print("|---|---|---|")
+          for k, v in r["tuned"].items():
+              m = " **<-**" if v != r["defaults"][k] else ""
+              print(f"| {k} | {r['defaults'][k]} | {v}{m} |")
+          print()
+          print("### Gate it (do not merge on SPSA alone)")
+          print("Dispatch `sprt.yml` with `test=` and `base=` the SAME ref and:")
+          print("```")
+          print("test_opts: " + r["uci_options"])
+          print("```")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spsa-${{ github.run_id }}
+          path: |
+            spsa_state.json
+            spsa_result.json
+            spsa.log
+          retention-days: 30

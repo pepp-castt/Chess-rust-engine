@@ -9,7 +9,7 @@ use crate::time::{Limits, TimeManager};
 use crate::tt::TranspositionTable;
 use crate::types::Color;
 use std::io::{self, BufRead, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 
@@ -58,6 +58,8 @@ pub fn run() {
     // Pre-init attack tables so `isready` is instant.
     let _ = crate::attacks::tables();
     let mut search_job: Option<(Arc<TimeManager>, JoinHandle<()>)> = None;
+    // Learned move-ordering tables survive between `go` commands of one game.
+    let persist: Arc<Mutex<Option<Box<ThreadData>>>> = Arc::new(Mutex::new(None));
 
     fn wait_search(job: &mut Option<(Arc<TimeManager>, JoinHandle<()>)>) {
         if let Some((tm, handle)) = job.take() {
@@ -82,6 +84,10 @@ pub fn run() {
                 println!("option name Threads type spin default 1 min 1 max 1");
                 println!("option name MoveOverhead type spin default 20 min 0 max 5000");
                 println!("option name Clear Hash type button");
+                println!("option name UseNNUE type check default true");
+                for line in crate::params::uci_options() {
+                    println!("{}", line);
+                }
                 println!("uciok");
             }
             "isready" => {
@@ -91,6 +97,7 @@ pub fn run() {
             "ucinewgame" => {
                 wait_search(&mut search_job);
                 engine.tt.clear();
+                *persist.lock().unwrap() = None;
                 engine.pos = Position::startpos();
                 engine.reset_hist();
             }
@@ -118,8 +125,24 @@ pub fn run() {
                             }
                         }
                         "Clear Hash" => engine.tt.clear(),
-                        _ => {}
+                        "UseNNUE" => {
+                            if let Some(v) = value {
+                                crate::nnue::set_enabled(v.eq_ignore_ascii_case("true"));
+                            }
+                        }
+                        other => {
+                            // Search tunables (src/params.rs). Unknown names are ignored per UCI.
+                            if let Some(v) = value.and_then(|s| s.trim().parse::<i32>().ok()) {
+                                crate::params::set(other, v);
+                            }
+                        }
                     }
+                }
+            }
+            "params" => {
+                // OpenBench-style SPSA spec: name, int, default, min, max, c_end, r_end
+                for line in crate::params::spsa_spec() {
+                    println!("{}", line);
                 }
             }
             "position" => {
@@ -220,12 +243,21 @@ pub fn run() {
                     engine.pos.side == Color::White,
                     engine.overhead_ms,
                 ));
-                let mut td = ThreadData::new(engine.tt.clone(), tm.clone());
+                let reused = persist.lock().unwrap().take();
+                let mut td = match reused {
+                    Some(mut b) => {
+                        b.prepare(engine.tt.clone(), tm.clone());
+                        b
+                    }
+                    None => Box::new(ThreadData::new(engine.tt.clone(), tm.clone())),
+                };
                 td.hash_hist = engine.moves_played.clone();
                 let pos = engine.pos;
                 let tm_for_job = tm.clone();
+                let persist_job = persist.clone();
                 let handle = thread::spawn(move || {
                     let res = iterative_deepening(&pos, &mut td, use_book);
+                    *persist_job.lock().unwrap() = Some(td);
                     println!("bestmove {}", res.best);
                     let _ = io::stdout().flush();
                 });
@@ -244,6 +276,11 @@ pub fn run() {
             "eval" => {
                 let e = evaluate(&engine.pos);
                 println!("info string eval {} cp (side to move)", e);
+                println!(
+                    "info string eval_hce {} eval_nnue {}",
+                    crate::eval::evaluate_hce(&engine.pos),
+                    crate::nnue::evaluate(&engine.pos).map_or("none".to_string(), |v| v.to_string())
+                );
             }
             "perft" => {
                 let d: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);

@@ -94,6 +94,21 @@ impl TranspositionTable {
         (hash & self.mask) as usize
     }
 
+    /// Hint the CPU to pull this hash's slot into cache. Called right after a
+    /// move is made so the DRAM latency overlaps with the child node's setup
+    /// (a pure performance hint: it never changes search results).
+    #[inline(always)]
+    pub fn prefetch(&self, hash: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let p = self.table.as_ptr().add(self.idx(hash)) as *const i8;
+            _mm_prefetch(p, _MM_HINT_T0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = hash;
+    }
+
     pub fn probe(&self, hash: u64) -> Option<(Move, i32, i32, u8)> {
         let e = &self.table[self.idx(hash)];
         let key = e.key.load(Ordering::Relaxed);

@@ -1,0 +1,64 @@
+{
+ "created_utc": "2026-11-09T13:18:13Z",
+ "audit_host": {
+  "platform": "Linux-6.1.189+-x86_64-with-glibc2.36",
+  "python": "3.11.2",
+  "numpy": "2.4.6"
+ },
+ "provenance": {
+  "teacher": "stockfish-19",
+  "movetime_ms": "500",
+  "threads": "1",
+  "hash": "64",
+  "source": "teacher-data/run-42595442579"
+ },
+ "records": 348714,
+ "unique": 348714,
+ "dup_rate": 0.0,
+ "split": {
+  "rule": "pos_hash % 20 == 0 -> validation",
+  "val": 17294,
+  "train": 331420
+ },
+ "wdl_loss_draw_win": [
+  45154,
+  259518,
+  44042
+ ],
+ "score_hist[-1500..1500]": [
+  13750,
+  13122,
+  21895,
+  252479,
+  21609,
+  12840,
+  13019
+ ],
+ "saturated_frac": 0.0247,
+ "sign_agreement_decisive": 1.0,
+ "piece_bucket_hist": [
+  21049,
+  29694,
+  48811,
+  54045,
+  51150,
+  52264,
+  54780,
+  36921
+ ],
+ "stm_black_frac": 0.4999,
+ "legality_sample": {
+  "checked": 5000,
+  "illegal": 0
+ },
+ "failures": [],
+ "warnings": [],
+ "files": [
+  {
+   "file": "real/teacher.bin",
+   "bytes": 9763992,
+   "records": 348714,
+   "sha256": "31adff34664b5b37abc495cfca0c10862ca822e4a3b1a91e9f7738f9a6e5a476"
+  }
+ ]
+}

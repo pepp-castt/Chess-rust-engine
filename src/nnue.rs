@@ -1,220 +1,229 @@
-//! Perspective NNUE: `(768 → H)×2 → 1` with SCReLU and i16 weights.
+//! NNUE evaluation: `(768 -> H) x2 -> 1`, SCReLU, i16 weights, 8 material output buckets.
 //!
-//! Feature set is 12×64 (piece-type × square) from the side-to-move’s view and
-//! from the opponent’s view. Reckless / Viridithas / Stockfish all use this
-//! family; the weights here are **ours**, trained on our data, never a SF net.
+//! Architecture, trainer (`tools/nnue/train.py`) and weights are original to this repo.
+//! Stockfish 19 is only used as a *teacher of position scores* (data), never as a net source.
 //!
-//! Full accumulator refresh is cheap at H=64 (~30 pieces × 64 adds). Incremental
-//! updates can land later once the net SPRTs.
+//! Feature index (perspective-relative, same convention as the trainer):
+//!   `((piece_color != perspective) * 6 + piece_type) * 64 + (sq ^ (56 * perspective))`
+//! The first layer is recomputed from scratch per evaluation (cheap for H=128 with AVX2);
+//! incremental accumulators are a later optimisation and need no change to the net format.
+//!
+//! Net file (little endian): `"CRN1" | version u32 | hidden u32 | buckets u32 | features u32`
+//! then `ft_w i16[768*H] | ft_b i16[H] | out_w i16[B*2H] | out_b i32[B]`.
+//! An empty / invalid net => HCE fallback. `CRE_NNUE_FILE` overrides the embedded net.
 
 use crate::board::Position;
-use crate::types::{Color, Piece, Square};
-use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
+pub const HIDDEN: usize = 128;
 pub const FEATURES: usize = 768;
-pub const HIDDEN: usize = 64;
+pub const BUCKETS: usize = 8;
 pub const QA: i32 = 255;
 pub const QB: i32 = 64;
 pub const SCALE: i32 = 400;
+const HEADER: usize = 20;
+const MAX_EVAL: i32 = 3000;
 
-const MAGIC: &[u8; 4] = b"CRN1";
+static EMBEDDED: &[u8] = include_bytes!("../nets/default.nnue");
+static ENABLED: AtomicBool = AtomicBool::new(true);
+static NET: OnceLock<Option<Network>> = OnceLock::new();
 
-#[derive(Clone)]
-pub struct Nnue {
-    /// Row-major `[hidden][feature]`
-    pub w1: Vec<i16>,
-    pub b1: [i16; HIDDEN],
-    pub w2: [i16; HIDDEN * 2],
-    pub b2: i16,
+pub struct Network {
+    ft_w: Vec<i16>,
+    ft_b: Vec<i16>,
+    out_w: Vec<i16>,
+    out_b: Vec<i32>,
+    avx2: bool,
 }
 
-static NET: OnceLock<Option<Nnue>> = OnceLock::new();
+fn rd_u32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
 
-pub fn net() -> Option<&'static Nnue> {
+impl Network {
+    pub fn parse(bytes: &[u8]) -> Result<Network, String> {
+        if bytes.len() < HEADER || &bytes[0..4] != b"CRN1" {
+            return Err("no net (bad magic / empty)".into());
+        }
+        let (h, b, f) = (
+            rd_u32(bytes, 8) as usize,
+            rd_u32(bytes, 12) as usize,
+            rd_u32(bytes, 16) as usize,
+        );
+        if h != HIDDEN || b != BUCKETS || f != FEATURES {
+            return Err(format!("net shape {f}x{h} b{b} != built-in {FEATURES}x{HIDDEN} b{BUCKETS}"));
+        }
+        let n_ft = FEATURES * HIDDEN;
+        let n_ow = BUCKETS * 2 * HIDDEN;
+        let want = HEADER + 2 * (n_ft + HIDDEN + n_ow) + 4 * BUCKETS;
+        if bytes.len() != want {
+            return Err(format!("net size {} != expected {}", bytes.len(), want));
+        }
+        let mut p = HEADER;
+        let i16s = |n: usize, p: &mut usize| -> Vec<i16> {
+            let v = (0..n)
+                .map(|i| i16::from_le_bytes([bytes[*p + 2 * i], bytes[*p + 2 * i + 1]]))
+                .collect();
+            *p += 2 * n;
+            v
+        };
+        let ft_w = i16s(n_ft, &mut p);
+        let ft_b = i16s(HIDDEN, &mut p);
+        let out_w = i16s(n_ow, &mut p);
+        let out_b = (0..BUCKETS).map(|i| rd_u32(bytes, p + 4 * i) as i32).collect();
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = is_x86_feature_detected!("avx2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx2 = false;
+        Ok(Network { ft_w, ft_b, out_w, out_b, avx2 })
+    }
+
+    #[inline(always)]
+    fn eval_impl(&self, pos: &Position) -> i32 {
+        let us = pos.side.index();
+        let them = us ^ 1;
+        let mut acc_us = [0i32; HIDDEN];
+        let mut acc_th = [0i32; HIDDEN];
+        for i in 0..HIDDEN {
+            acc_us[i] = self.ft_b[i] as i32;
+            acc_th[i] = self.ft_b[i] as i32;
+        }
+        for color in 0..2usize {
+            for ty in 0..6usize {
+                let mut bb = pos.pieces[ty] & pos.colors[color];
+                while bb != 0 {
+                    let s = bb.trailing_zeros() as usize;
+                    bb &= bb - 1;
+                    let f_us = ((((color != us) as usize) * 6 + ty) * 64 + (s ^ (56 * us))) * HIDDEN;
+                    let f_th = ((((color != them) as usize) * 6 + ty) * 64 + (s ^ (56 * them))) * HIDDEN;
+                    let ru = &self.ft_w[f_us..f_us + HIDDEN];
+                    let rt = &self.ft_w[f_th..f_th + HIDDEN];
+                    for i in 0..HIDDEN {
+                        acc_us[i] += ru[i] as i32;
+                        acc_th[i] += rt[i] as i32;
+                    }
+                }
+            }
+        }
+        let n = (pos.colors[0] | pos.colors[1]).count_ones() as usize;
+        let bucket = (n.saturating_sub(2) / 4).min(BUCKETS - 1);
+        let w = &self.out_w[bucket * 2 * HIDDEN..(bucket + 1) * 2 * HIDDEN];
+        let mut sum = 0i32;
+        for i in 0..HIDDEN {
+            let c = acc_us[i].clamp(0, QA);
+            sum += c * c * w[i] as i32;
+            let d = acc_th[i].clamp(0, QA);
+            sum += d * d * w[HIDDEN + i] as i32;
+        }
+        let out = (sum / QA + self.out_b[bucket]) as i64 * SCALE as i64 / (QA * QB) as i64;
+        (out as i32).clamp(-MAX_EVAL, MAX_EVAL)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn eval_avx2(&self, pos: &Position) -> i32 {
+        self.eval_impl(pos)
+    }
+
+    #[inline]
+    pub fn eval(&self, pos: &Position) -> i32 {
+        #[cfg(target_arch = "x86_64")]
+        if self.avx2 {
+            // SAFETY: avx2 availability was checked at load time.
+            return unsafe { self.eval_avx2(pos) };
+        }
+        self.eval_impl(pos)
+    }
+}
+
+fn load() -> Option<Network> {
+    if let Ok(path) = std::env::var("CRE_NNUE_FILE") {
+        return match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| Network::parse(&b)) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                eprintln!("info string NNUE file {path}: {e}");
+                None
+            }
+        };
+    }
+    Network::parse(EMBEDDED).ok()
+}
+
+pub fn net() -> Option<&'static Network> {
     NET.get_or_init(load).as_ref()
 }
 
-fn load() -> Option<Nnue> {
-    // HCE A/B: CRE_NO_NNUE=1  or  CRE_NNUE=/path/to/net.bin
-    if std::env::var_os("CRE_NO_NNUE").is_some() {
-        return None;
-    }
-    let mut paths: Vec<String> = Vec::new();
-    if let Ok(p) = std::env::var("CRE_NNUE") {
-        paths.push(p);
-    }
-    paths.extend([
-        "nets/v1.bin".into(),
-        "./v1.bin".into(),
-        "v1.bin".into(),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/nets/v1.bin").into(),
-    ]);
-    for path in paths {
-        if let Ok(bytes) = fs::read(&path) {
-            if let Some(n) = parse(&bytes) {
-                println!("info string nnue loaded {} ({} bytes)", path, bytes.len());
-                return Some(n);
-            }
-        }
-    }
-    None
+pub fn is_loaded() -> bool {
+    net().is_some()
 }
 
-pub fn parse(bytes: &[u8]) -> Option<Nnue> {
-    if bytes.len() < 4 + 4 {
-        return None;
-    }
-    if &bytes[0..4] != MAGIC {
-        return None;
-    }
-    let h = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
-    if h != HIDDEN {
-        return None;
-    }
-    let need = 8 + HIDDEN * FEATURES * 2 + HIDDEN * 2 + HIDDEN * 2 * 2 + 2;
-    if bytes.len() < need {
-        return None;
-    }
-    let mut o = 8;
-    let mut w1 = vec![0i16; HIDDEN * FEATURES];
-    for w in w1.iter_mut() {
-        *w = i16::from_le_bytes(bytes[o..o + 2].try_into().ok()?);
-        o += 2;
-    }
-    let mut b1 = [0i16; HIDDEN];
-    for b in b1.iter_mut() {
-        *b = i16::from_le_bytes(bytes[o..o + 2].try_into().ok()?);
-        o += 2;
-    }
-    let mut w2 = [0i16; HIDDEN * 2];
-    for w in w2.iter_mut() {
-        *w = i16::from_le_bytes(bytes[o..o + 2].try_into().ok()?);
-        o += 2;
-    }
-    let b2 = i16::from_le_bytes(bytes[o..o + 2].try_into().ok()?);
-    Some(Nnue { w1, b1, w2, b2 })
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::Relaxed);
 }
 
 #[inline]
-pub(crate) fn feature(stm: Color, piece: Piece, sq: Square) -> usize {
-    let sq = if stm == Color::White {
-        sq.index()
-    } else {
-        sq.index() ^ 56
-    };
-    let side = if piece.color() == stm { 0 } else { 6 };
-    (side + piece.ty().index()) * 64 + sq
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
 }
 
-fn acc(pos: &Position, stm: Color, net: &Nnue) -> [i32; HIDDEN] {
-    let mut a = [0i32; HIDDEN];
-    for i in 0..HIDDEN {
-        a[i] = net.b1[i] as i32;
-    }
-    for sq in 0..64u8 {
-        let p = pos.piece_on(Square(sq));
-        if p.is_none() {
-            continue;
-        }
-        let f = feature(stm, p, Square(sq));
-        // w1 is row-major [hidden][feature]
-        for h in 0..HIDDEN {
-            a[h] += net.w1[h * FEATURES + f] as i32;
-        }
-    }
-    a
-}
-
+/// NNUE score from the side to move, or `None` when no net is loaded.
 #[inline]
-fn screlu(x: i32) -> i32 {
-    let y = x.clamp(0, QA);
-    y * y
-}
-
-/// Evaluation in centipawns from the side to move.
 pub fn evaluate(pos: &Position) -> Option<i32> {
-    let net = net()?;
-    let stm = pos.side;
-    let a_us = acc(pos, stm, net);
-    let a_them = acc(pos, stm.flip(), net);
-    let mut v = net.b2 as i64;
-    for i in 0..HIDDEN {
-        v += screlu(a_us[i]) as i64 * net.w2[i] as i64;
-        v += screlu(a_them[i]) as i64 * net.w2[HIDDEN + i] as i64;
-    }
-    // v is in (QA^2 * QB) * (float output) units. SCALE maps 1.0 → 400 cp.
-    // Must use i64: a queen-up position is ~8e6 raw * 400 which overflows i32.
-    Some((v * SCALE as i64 / (QA as i64 * QA as i64 * QB as i64)) as i32)
+    net().map(|n| n.eval(pos))
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{PieceType, Square};
 
-    #[test]
-    fn feature_white_pawn_a2() {
-        let p = Piece::new(Color::White, PieceType::Pawn);
-        assert_eq!(feature(Color::White, p, Square(8)), 8);
-    }
-
-    #[test]
-    fn feature_black_pawn_a7_from_white() {
-        let p = Piece::new(Color::Black, PieceType::Pawn);
-        assert_eq!(feature(Color::White, p, Square(48)), 6 * 64 + 48);
-    }
-
-    #[test]
-    fn feature_stm_black_flips_square() {
-        // white pawn a2 seen by black: not-stm, sq ^= 56 → 48
-        let p = Piece::new(Color::White, PieceType::Pawn);
-        assert_eq!(feature(Color::Black, p, Square(8)), 6 * 64 + 48);
-    }
-
-    #[test]
-    fn parse_rejects_short() {
-        assert!(parse(b"CRN1").is_none());
-        assert!(parse(b"XXXX").is_none());
-    }
-
-    #[test]
-    fn kqk_features_and_eval() {
-        use crate::board::Position;
-        let pos = Position::from_fen("4k3/8/8/8/8/8/8/4K2Q w - - 0 1").unwrap();
-        let mut fs = Vec::new();
-        for sq in 0..64u8 {
-            let p = pos.piece_on(Square(sq));
-            if p.is_none() {
-                continue;
-            }
-            fs.push((sq, p.ty().index(), p.color().index(), feature(pos.side, p, Square(sq))));
+    fn blank(fill_w: i16, out_w: i16, out_b: i32) -> Vec<u8> {
+        let mut v = b"CRN1".to_vec();
+        for x in [1u32, HIDDEN as u32, BUCKETS as u32, FEATURES as u32] {
+            v.extend_from_slice(&x.to_le_bytes());
         }
-        let mut feats: Vec<usize> = fs.iter().map(|x| x.3).collect();
-        feats.sort();
-        assert_eq!(feats, vec![263, 324, 764], "features {fs:?}");
-        if let Ok(bytes) = std::fs::read("nets/hce-distill.bin") {
-            let net = parse(&bytes).expect("net");
-            let stm = pos.side;
-            let a_us = acc(&pos, stm, &net);
-            let a_them = acc(&pos, stm.flip(), &net);
-            let mut them_f = Vec::new();
-            for sq in 0..64u8 {
-                let p = pos.piece_on(Square(sq));
-                if p.is_none() {
-                    continue;
-                }
-                them_f.push(feature(stm.flip(), p, Square(sq)));
-            }
-            them_f.sort();
-            let mut v = net.b2 as i64;
-            for i in 0..HIDDEN {
-                v += screlu(a_us[i]) as i64 * net.w2[i] as i64;
-                v += screlu(a_them[i]) as i64 * net.w2[HIDDEN + i] as i64;
-            }
-            let cp = (v * SCALE as i64 / (QA as i64 * QA as i64 * QB as i64)) as i32;
-            assert_eq!(them_f, vec![324, 703, 764]);
-            assert!(cp > 400, "KQK should be a queen ahead, got {cp}");
+        for _ in 0..FEATURES * HIDDEN {
+            v.extend_from_slice(&fill_w.to_le_bytes());
         }
+        for _ in 0..HIDDEN {
+            v.extend_from_slice(&0i16.to_le_bytes());
+        }
+        for _ in 0..BUCKETS * 2 * HIDDEN {
+            v.extend_from_slice(&out_w.to_le_bytes());
+        }
+        for _ in 0..BUCKETS {
+            v.extend_from_slice(&out_b.to_le_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn rejects_empty_and_wrong_shape() {
+        assert!(Network::parse(&[]).is_err());
+        assert!(Network::parse(b"CRN1").is_err());
+        let mut v = blank(0, 0, 0);
+        v.pop();
+        assert!(Network::parse(&v).is_err());
+    }
+
+    #[test]
+    fn extreme_accumulators_do_not_overflow() {
+        // Every feature weight at +i16::MAX saturates all SCReLU units at QA; output
+        // weights at the trainer's clamp (1.98 * QB = 127) give the worst-case i32 sum.
+        let net = Network::parse(&blank(i16::MAX, 127, i32::MAX / 4)).unwrap();
+        let pos = Position::startpos();
+        let v = net.eval(&pos);
+        assert!((-MAX_EVAL..=MAX_EVAL).contains(&v), "eval {v} outside clamp");
+        let net = Network::parse(&blank(i16::MAX, -127, i32::MIN / 4)).unwrap();
+        let v = net.eval(&pos);
+        assert!((-MAX_EVAL..=MAX_EVAL).contains(&v), "eval {v} outside clamp");
+    }
+
+    #[test]
+    fn zero_net_evals_zero_and_is_perspective_symmetric() {
+        let net = Network::parse(&blank(0, 0, 0)).unwrap();
+        let a = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        assert_eq!(net.eval(&a), 0);
     }
 }

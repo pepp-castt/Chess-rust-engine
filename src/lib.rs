@@ -5,6 +5,7 @@ pub mod book;
 pub mod datagen;
 pub mod eval;
 pub mod nnue;
+pub mod params;
 pub mod movegen;
 pub mod perft;
 pub mod search;

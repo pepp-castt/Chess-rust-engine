@@ -11,3 +11,4 @@ chess-rust-engine
 datasets/*.jsonl
 nets/*.bin
 !nets/.gitkeep
+!nets/default.nnue

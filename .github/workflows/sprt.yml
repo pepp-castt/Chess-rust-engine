@@ -77,6 +77,13 @@ jobs:
           ref: ${{ inputs.base }}
           path: base
 
+      # Harness files (opening book, report script) come from the workflow's own
+      # ref, never from the code under test - so old commits can be gated too.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: harness
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Validate time control (no sub-floor games)
@@ -136,9 +143,8 @@ jobs:
         run: |
           mkdir -p out
           # real mainline openings (6/8/10 plies); openings.epd is random-legal junk
-          OPENINGS=test/tools/openings_book.epd
-          [ -f "$OPENINGS" ] || OPENINGS=base/tools/openings_book.epd
-          [ -f "$OPENINGS" ] || OPENINGS=test/tools/openings.epd
+          OPENINGS=harness/tools/openings_book.epd
+          test -s "$OPENINGS"
           # CRE_NNUE_FILE (set above when test_net is given) must only reach TEST,
           # so BASE is launched through a wrapper that unsets it.
           printf '#!/bin/sh\nunset CRE_NNUE_FILE\nexec "%s" "$@"\n' "$PWD/engine_base" > base_run.sh
@@ -162,7 +168,7 @@ jobs:
       - name: Verdict
         run: |
           set +e
-          S=test/tools/sprt_report.py; [ -f "$S" ] || S=base/tools/sprt_report.py
+          S=harness/tools/sprt_report.py
           python3 "$S" out/sprt.log --md out/verdict.md --min-games 60
           code=$?
           {

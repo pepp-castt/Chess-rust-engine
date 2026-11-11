@@ -77,7 +77,15 @@ fn load_openings() -> Vec<String> {
 pub fn run(n: usize, depth: i32, out_path: &str) {
     let openings = load_openings();
     let tt = Arc::new(TranspositionTable::new(16));
-    let mut rng = Rng(0xC0FF_EE12_3456_789A);
+    // Shards must not replay the same games. `CRE_DATAGEN_SEED=<n>` selects a
+    // different stream; unset keeps the historical seed (bit-identical output).
+    const DEFAULT_SEED: u64 = 0xC0FF_EE12_3456_789A;
+    let seed = std::env::var("CRE_DATAGEN_SEED")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| (v.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ DEFAULT_SEED).max(1))
+        .unwrap_or(DEFAULT_SEED);
+    let mut rng = Rng(seed);
     let file = File::create(out_path).expect("datagen out");
     let mut w = BufWriter::new(file);
     let start = Instant::now();
