@@ -1,0 +1,196 @@
+name: LS train (Lichess scale) + gate
+
+# Agent LS, EXP-LS2. Same model/loss as tools/nnue/train.py (H=128, 8 buckets, lam=1.0: Lichess
+# records are score-only, no game result is invented). One variable: data volume.
+#   arm d5 = all converted shards, arm d2 = shards 0-1 only, identical wall-clock training budget.
+# Gate = 5 independent 200-game replicates vs HCE per arm + head-to-heads (d5 vs d2, each vs R's net).
+# Lichess labels are various Stockfish versions (CC0 eval DB), NOT the pinned SF19; SF19 stays the
+# benchmark opponent / stage-2 teacher. Keep/revert on the gate only, never on val loss.
+
+on:
+  push:
+    branches: ["agentLS/**"]
+    paths: ["ls/train.json", ".github/workflows/ls-train.yml"]
+
+env:
+  UPSTREAM: archanapriyadarshini1st-debug/Chess-rust-engine
+  NI52_SHA: f87e85de7fd2ab885d55e716af8af71dc0479cd2
+  RNET: nets/candidates/lichess15m-R-bb5bb8a868c1.nnue
+  FASTCHESS_URL: https://github.com/Disservin/fastchess/releases/download/v1.8.3-alpha/fastchess-linux-x86-64.tar
+  HF_BASE: https://huggingface.co/datasets/Lichess/chess-position-evaluations/resolve/main/data
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.p.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: p
+        run: echo "shards=$(jq -c .shards ls/train.json)" >> "$GITHUB_OUTPUT"
+
+  convert:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyarrow python-chess numpy
+      - name: Converter self-test
+        run: python3 tools/nnue/lichess_to_records.py --selftest
+      - name: Download shard
+        run: |
+          N=$(printf '%04d' ${{ matrix.shard }})
+          curl -fL --retry 6 --retry-delay 10 -sS -o /tmp/shard.parquet "$HF_BASE/data_$N.parquet"
+          ls -la /tmp/shard.parquet; sha256sum /tmp/shard.parquet
+      - name: "Score-perspective guard (cp must be White-POV)"
+        run: python3 tools/nnue/lichess_pov_check.py /tmp/shard.parquet 100000 | tee /tmp/pov.txt && grep -q "WHITE-POV" /tmp/pov.txt
+      - name: Convert
+        run: |
+          N=$(printf '%04d' ${{ matrix.shard }})
+          mkdir -p out
+          python3 tools/nnue/lichess_to_records.py --in /tmp/shard.parquet --out out/lichess_$N.bin \
+            --min-depth $(jq -r .min_depth ls/train.json) --max-out $(jq -r .max_out ls/train.json) --seed ${{ matrix.shard }} | tail -30
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lichess-${{ matrix.shard }}
+          path: out/
+          retention-days: 14
+          compression-level: 3
+
+  train:
+    needs: convert
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arm: d5, glob: "data/*.bin"}
+          - {arm: d2, glob: "data/lichess_000[01].bin"}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lichess-*
+          path: data
+          merge-multiple: true
+      - name: Install trainer deps
+        run: |
+          pip install numpy chess
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Data summary
+        run: |
+          ls -la data; free -g | head -2; nproc
+          python3 - <<'PY' | tee data_summary.txt
+          import glob, json
+          tot = 0
+          for f in sorted(glob.glob("data/*.json")):
+              o = json.load(open(f)); tot += o["records"]
+              print(o["source_file"], o["records"], o["stats"])
+          print("total records (all shards)", tot)
+          PY
+      - name: Train
+        run: |
+          python3 tools/nnue/train_ls.py --data '${{ matrix.glob }}' --out net.bin --lam 1.0 \
+            --minutes $(jq -r .train_minutes ls/train.json) > train.log 2>&1 &
+          PID=$!
+          while kill -0 $PID 2>/dev/null; do sleep 600; grep -E "files=|decoded|== " train.log | tail -2; free -m | sed -n 2p; done
+          wait $PID
+          grep -E "files=|decoded|final|exported" train.log | tail -8
+          sha256sum net.bin
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: net-${{ matrix.arm }}
+          path: |
+            net.bin
+            net.bin.parity.txt
+            train.log
+            data_summary.txt
+          retention-days: 30
+
+  gate:
+    needs: train
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {a: d5, b: HCE, seed: 101}
+          - {a: d5, b: HCE, seed: 102}
+          - {a: d5, b: HCE, seed: 103}
+          - {a: d5, b: HCE, seed: 104}
+          - {a: d5, b: HCE, seed: 105}
+          - {a: d2, b: HCE, seed: 101}
+          - {a: d2, b: HCE, seed: 102}
+          - {a: d2, b: HCE, seed: 103}
+          - {a: d2, b: HCE, seed: 104}
+          - {a: d2, b: HCE, seed: 105}
+          - {a: d5, b: d2, seed: 111}
+          - {a: d5, b: d2, seed: 112}
+          - {a: d5, b: R, seed: 121}
+          - {a: d5, b: R, seed: 122}
+          - {a: d2, b: R, seed: 121}
+    name: gate-${{ matrix.a }}-vs-${{ matrix.b }}-s${{ matrix.seed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ env.NI52_SHA }}
+          path: eng
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: net-*
+          path: nets_in
+      - name: Build
+        run: |
+          (cd eng && cargo build --release && git rev-parse HEAD)
+          cp eng/target/release/chess-rust-engine ./engine
+          echo "bench: $(timeout 180 ./engine bench 10 | tail -1)"
+          mkdir -p /tmp/fc
+          curl -fsSL --retry 3 "$FASTCHESS_URL" -o /tmp/fc.tar && tar xf /tmp/fc.tar -C /tmp/fc
+          FC=$(find /tmp/fc -type f -name fastchess | head -1); chmod +x "$FC"; ln -sf "$FC" /tmp/fastchess
+      - name: Play
+        run: |
+          GAMES=$(jq -r .games ls/train.json); TC=$(jq -r .tc ls/train.json)
+          ENG=$(readlink -f ./engine); BOOK=eng/tools/openings_book.epd; mkdir -p out
+          spec () {  # $1 = arm name -> fastchess engine spec
+            case "$1" in
+              HCE) echo "-engine name=HCE cmd=$ENG option.UseNNUE=false option.Hash=64" ;;
+              *) if [ "$1" = R ]; then N=$(readlink -f "$RNET"); else N=$(readlink -f "nets_in/net-$1/net.bin"); fi
+                 test -s "$N"
+                 printf '#!/usr/bin/env bash\nexport CRE_NNUE_FILE="%s"\nexec "%s" "$@"\n' "$N" "$ENG" > "out/$1.sh"; chmod +x "out/$1.sh"
+                 echo "net_$1_sha=$(sha256sum "$N" | cut -c1-12)" >> out/nets.txt
+                 echo "-engine name=NET_$1 cmd=out/$1.sh option.UseNNUE=true option.Hash=64" ;;
+            esac
+          }
+          A=$(spec ${{ matrix.a }}); B=$(spec ${{ matrix.b }})
+          /tmp/fastchess $A $B -each tc="$TC" \
+            -openings file="$BOOK" format=epd order=random -srand ${{ matrix.seed }} \
+            -rounds $((GAMES / 2)) -games 2 -repeat -concurrency 3 \
+            -pgnout file=out/games.pgn -recover -ratinginterval 20 > out/gate.log 2>&1 || true
+          echo "config: a=${{ matrix.a }} b=${{ matrix.b }} eng_commit=$NI52_SHA engine_sha=$(sha256sum "$ENG" | cut -c1-12) $(tr '\n' ' ' < out/nets.txt) tc=$TC games=$GAMES seed=${{ matrix.seed }} book_sha=$(sha256sum "$BOOK" | cut -c1-12) hash=64 threads=1 conc=3" | tee out/config.txt
+          echo "LSRESULT_BEGIN"; tail -n 16 out/gate.log; echo "LSRESULT_END"
+          grep -ciE "disconnect|stall|illegal|loses on time|timeout" out/gate.log | sed 's/^/anomaly_lines: /' || true
+          { echo "## ${{ matrix.a }} vs ${{ matrix.b }} seed ${{ matrix.seed }}"; echo '```'; tail -n 16 out/gate.log; cat out/config.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate-${{ matrix.a }}-vs-${{ matrix.b }}-s${{ matrix.seed }}
+          path: out/
+          retention-days: 30

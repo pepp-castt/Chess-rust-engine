@@ -1,0 +1,1 @@
+{"shards": [0,1,2,3,4], "max_out": 0, "min_depth": 20, "train_minutes": 285, "games": 200, "tc": "10+0.1", "note": "EXP-LS2 run 1: d5 = shards 0-4 whole, d2 = shards 0-1 whole, same trainer/minutes"}
