@@ -1,0 +1,100 @@
+name: LS gate (net vs HCE x5, A/A, SF19 anchor)
+
+# Agent LS, EXP-LS1. Replicates a net-vs-HCE gate 5 times with independent opening draws,
+# on two engine builds (main, and main + PR #52 incremental accumulator), plus an A/A control
+# and a Stockfish 19 UCI_Elo anchor. Push-triggered: edit ls/gate.json on an agentLS/* branch.
+# Stockfish is a benchmark opponent only. Never a runtime dependency.
+
+on:
+  push:
+    branches: ["agentLS/**"]
+    paths: ["ls/gate.json", ".github/workflows/ls-gate.yml"]
+
+env:
+  UPSTREAM: archanapriyadarshini1st-debug/Chess-rust-engine
+  MAIN_SHA: 581b8eef45a0d3298d9229c900173ea15a85555f
+  NI52_SHA: f87e85de7fd2ab885d55e716af8af71dc0479cd2
+  FASTCHESS_URL: https://github.com/Disservin/fastchess/releases/download/v1.8.3-alpha/fastchess-linux-x86-64.tar
+  SF19_URL: https://github.com/official-stockfish/Stockfish/releases/download/sf_19/stockfish-linux-x86-64-universal.tar.gz
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {mode: net_hce, eng: main, seed: 101}
+          - {mode: net_hce, eng: main, seed: 102}
+          - {mode: net_hce, eng: main, seed: 103}
+          - {mode: net_hce, eng: main, seed: 104}
+          - {mode: net_hce, eng: main, seed: 105}
+          - {mode: net_hce, eng: ni52, seed: 101}
+          - {mode: net_hce, eng: ni52, seed: 102}
+          - {mode: net_hce, eng: ni52, seed: 103}
+          - {mode: net_hce, eng: ni52, seed: 104}
+          - {mode: net_hce, eng: ni52, seed: 105}
+          - {mode: aa_hce, eng: main, seed: 101}
+          - {mode: net_sf2600, eng: ni52, seed: 201}
+          - {mode: hce_sf2600, eng: main, seed: 201}
+          - {mode: net_sf3000, eng: ni52, seed: 301}
+    name: ${{ matrix.mode }}-${{ matrix.eng }}-s${{ matrix.seed }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve engine SHA
+        id: sha
+        run: |
+          if [ "${{ matrix.eng }}" = "ni52" ]; then echo "sha=$NI52_SHA" >> "$GITHUB_OUTPUT"; else echo "sha=$MAIN_SHA" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.sha.outputs.sha }}
+          path: eng
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build engine + tools
+        run: |
+          (cd eng && cargo build --release && git rev-parse HEAD)
+          cp eng/target/release/chess-rust-engine ./engine
+          echo "bench: $(timeout 180 ./engine bench 10 | tail -1)"
+          mkdir -p /tmp/fc /tmp/sf
+          curl -fsSL --retry 3 "$FASTCHESS_URL" -o /tmp/fc.tar && tar xf /tmp/fc.tar -C /tmp/fc
+          FC=$(find /tmp/fc -type f -name fastchess | head -1); chmod +x "$FC"; ln -sf "$FC" /tmp/fastchess
+          case "${{ matrix.mode }}" in *sf*)
+            curl -fsSL --retry 3 "$SF19_URL" | tar xz -C /tmp/sf
+            SF=$(find /tmp/sf -type f -name 'stockfish-linux-x86-64-universal' | head -1)
+            chmod +x "$SF"; ln -sf "$SF" /tmp/sf19
+            printf 'uci\nquit\n' | /tmp/sf19 | grep -E 'id name'
+            sha256sum "$SF" | cut -c1-16 ;;
+          esac
+      - name: Play
+        run: |
+          GAMES=$(jq -r .games ls/gate.json); TC=$(jq -r .tc ls/gate.json); NET=$(readlink -f "$(jq -r .net ls/gate.json)")
+          ENG=$(readlink -f ./engine); BOOK=eng/tools/openings_book.epd
+          mkdir -p out
+          printf '#!/usr/bin/env bash\nexport CRE_NNUE_FILE="%s"\nexec "%s" "$@"\n' "$NET" "$ENG" > out/net.sh; chmod +x out/net.sh
+          # NNUE speed sanity: nps with the net on
+          printf 'setoption name UseNNUE value true\nposition startpos\ngo movetime 2000\nquit\n' | out/net.sh | grep -E "^info" | tail -1 | cut -c1-200 || true
+          printf 'setoption name UseNNUE value false\nposition startpos\ngo movetime 2000\nquit\n' | ./engine | grep -E "^info" | tail -1 | cut -c1-200 || true
+          NETE="-engine name=NET cmd=out/net.sh option.UseNNUE=true option.Hash=64"
+          HCEE="-engine name=HCE cmd=$ENG option.UseNNUE=false option.Hash=64"
+          case "${{ matrix.mode }}" in
+            net_hce)    A="$NETE"; B="$HCEE" ;;
+            aa_hce)     A="-engine name=HCE_A cmd=$ENG option.UseNNUE=false option.Hash=64"; B="-engine name=HCE_B cmd=$ENG option.UseNNUE=false option.Hash=64" ;;
+            net_sf2600) A="$NETE"; B="-engine name=SF19_2600 cmd=/tmp/sf19 option.Hash=64 option.Threads=1 option.UCI_LimitStrength=true option.UCI_Elo=2600" ;;
+            hce_sf2600) A="$HCEE"; B="-engine name=SF19_2600 cmd=/tmp/sf19 option.Hash=64 option.Threads=1 option.UCI_LimitStrength=true option.UCI_Elo=2600" ;;
+            net_sf3000) A="$NETE"; B="-engine name=SF19_3000 cmd=/tmp/sf19 option.Hash=64 option.Threads=1 option.UCI_LimitStrength=true option.UCI_Elo=3000" ;;
+          esac
+          /tmp/fastchess $A $B -each tc="$TC" \
+            -openings file="$BOOK" format=epd order=random -srand ${{ matrix.seed }} \
+            -rounds $((GAMES / 2)) -games 2 -repeat -concurrency 3 \
+            -pgnout file=out/games.pgn -recover -ratinginterval 20 > out/gate.log 2>&1 || true
+          echo "config: mode=${{ matrix.mode }} eng=${{ matrix.eng }} eng_commit=${{ steps.sha.outputs.sha }} engine_sha=$(sha256sum "$ENG" | cut -c1-12) net_sha=$(sha256sum "$NET" | cut -c1-12) tc=$TC games=$GAMES seed=${{ matrix.seed }} book_sha=$(sha256sum "$BOOK" | cut -c1-12) hash=64 threads=1 conc=3" | tee out/config.txt
+          echo "LSRESULT_BEGIN"; tail -n 16 out/gate.log; echo "LSRESULT_END"
+          grep -ciE "disconnect|stall|illegal|loses on time|timeout" out/gate.log | sed 's/^/anomaly_lines: /' || true
+          { echo "## ${{ matrix.mode }} ${{ matrix.eng }} seed ${{ matrix.seed }}"; echo '```'; tail -n 16 out/gate.log; cat out/config.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ls-${{ matrix.mode }}-${{ matrix.eng }}-s${{ matrix.seed }}
+          path: out/
+          retention-days: 30
